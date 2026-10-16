@@ -1,0 +1,10 @@
+# LMS Karaoke 歌词浮窗 —— 第三方依赖
+#
+# 说明：
+#   · tkinter 是 Python 标准库，Windows 官方安装包已自带，无需 pip 安装。
+#     若在 Linux 上运行，请先安装系统包：sudo apt install python3-tk
+#   · Pillow 用于显示专辑封面；未安装时程序仍可运行，只是封面区显示默认唱片图标。
+#   · requests 用于 LRCLIB 在线歌词源；未安装时自动跳过该源。
+
+Pillow>=10.0.0
+requests>=2.31.0
