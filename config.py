@@ -40,7 +40,7 @@ class Config:
     FONT_FAMILY = "Microsoft YaHei UI"
     FONT_SIZE = 30
 
-    COLOR_ACTIVE = "#03E8FB"
+    COLOR_ACTIVE = "#5453d7"
     COLOR_IDLE   = "#F0F0F8"
     COLOR_KEY    = "#010204"
     COLOR_STROKE = "#B8B8C4"
