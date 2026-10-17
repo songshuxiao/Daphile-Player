@@ -2,8 +2,8 @@
 <p align = "center">   
 <img src="src/Daphile-Player.jpg" width="50%" alt="Daphile-Player"/>
 </p>   
-支持手动输入IP连接和远程唤醒（首次连接成功后，自动记住达菲设备MAC地址）
+支持达菲设备远程关机、手动输入IP连接和远程唤醒（首次连接成功后，自动记住达菲设备MAC地址）
 <p align = "center">   
 <img src="src/Daphile-Connection.jpg" width="50%" alt="Daphile-Connection"/>
 </p>   
-本项目需要达菲安装[Material Skin](https://github.com/CDrummond/lms-material)和Music and Artist Information插件
+本项目需要达菲安装 <a href="https://github.com/CDrummond/lms-material">Material Skin</a> 和 Music and Artist Information 插件
