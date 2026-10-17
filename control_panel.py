@@ -372,6 +372,7 @@ class ControlPanel:
         btn_group = tk.Frame(nb, bg=self.BG)
         btn_group.place(relx=1.0, x=-8, y=10, anchor="ne")
 
+        # 顺序：⚙ 设置 → ● 桌面歌词 → ⏻ 关闭达菲
         self.btn_settings = self._make_round_btn(
             btn_group, "⚙ 设置", self._toggle_lyrics_panel,
             width=64, height=22, radius=8)
@@ -543,6 +544,9 @@ class ControlPanel:
                                 font=("Microsoft YaHei UI", 9))
         self.lbl_lib.pack(side="left", padx=0)
 
+        # ★ tab 切换时同步设置按钮显隐与窗口高度
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         self._lib_show_artists()
 
     def _mk_btn(self, parent, text, cmd, width=None):
@@ -586,26 +590,56 @@ class ControlPanel:
     
     def _calc_panel_height(self):
         """返回合适的窗口高度：
-           · 展开歌词外观 → 固定 480（内容自适应偏麻烦，直接给够）
-           · 收起歌词外观 → 固定 360，所有控件完整可见"""
+           · 展开歌词外观 → 固定 472（内容自适应偏麻烦，直接给够）
+           · 收起歌词外观 → 固定 365，所有控件完整可见"""
         if self._lyrics_appearance_visible:
-            return 480
-        return 360
-    
-    def _toggle_lyrics_panel(self):
-        """切换歌词外观设置面板的显示 / 隐藏，并按状态调整窗口高度"""
-        if self._lyrics_appearance_visible:
-            self.ap.pack_forget()
-            self._lyrics_appearance_visible = False
-            self.btn_settings.set_text("⚙ 外观")
+            return 472
+        return 365
+
+    def _on_tab_changed(self, _e=None):
+        """tab 切换时：
+           · 播放页（index 0） → 显示 ⚙ 设置 按钮
+           · 音乐库（index 1） → 隐藏 ⚙ 设置 按钮
+           · 窗口高度只由歌词外观展开状态决定，与 tab 无关：
+             展开 472 / 收起 365，切 tab 高度不变"""
+        try:
+            cur = self.nb.index(self.nb.select())
+        except Exception:
+            return
+
+        if cur == 0:
+            # 播放页：恢复设置按钮，插到桌面歌词按钮左侧
+            self.btn_settings.pack_forget()
+            self.btn_settings.pack(side="left", padx=(0, 6),
+                                   before=self.btn_lyrics)
         else:
-            self.ap.pack(fill="x")
-            self._lyrics_appearance_visible = True
-            self.btn_settings.set_text("⚙ 外观")
+            # 音乐库：隐藏设置按钮
+            self.btn_settings.pack_forget()
+
+        h = 472 if self._lyrics_appearance_visible else 365
 
         self.panel.update_idletasks()
         try:
-            self.panel.geometry(f"500x{self._calc_panel_height()}")
+            self.panel.geometry(f"500x{h}")
+        except tk.TclError:
+            pass
+    
+    def _toggle_lyrics_panel(self):
+        """切换歌词外观设置面板的显示 / 隐藏，并按状态调整窗口高度。
+           ★ 按钮文字始终保持「⚙ 设置」，不随展开/收起变化。"""
+        if self._lyrics_appearance_visible:
+            self.ap.pack_forget()
+            self._lyrics_appearance_visible = False
+        else:
+            self.ap.pack(fill="x")
+            self._lyrics_appearance_visible = True
+
+        # 高度始终由"歌词外观展开状态"决定
+        h = self._calc_panel_height()
+
+        self.panel.update_idletasks()
+        try:
+            self.panel.geometry(f"500x{h}")
         except tk.TclError:
             pass
 
