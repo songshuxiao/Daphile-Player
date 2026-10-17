@@ -168,17 +168,29 @@ class NetDiscovery:
     # ---------- 对外总入口 ----------
     @classmethod
     def auto_discover(cls):
-        """返回 (ip, port) 或 None"""
-        print("[发现] UDP 广播探测中…")
-        for info in cls.udp_discover(1.5):
-            print(f"[发现] UDP 命中: {info['name']} @ {info['ip']}")
-            return info["ip"], info["port"]
-        ips = cls.build_ip_list()
-        print(f"[发现] UDP 未命中，自动扫描本机网段 {len(ips)} 个地址 "
-              f"({', '.join(map(str, Config.SCAN_PORTS))} 端口)…")
-        hit = cls.auto_scan(ips)
-        if hit:
-            print(f"[发现] TCP 命中: {hit[2]} @ {hit[0]}:{hit[1]}")
-            return hit[0], hit[1]
-        print("[发现] 未找到 Daphile/LMS 服务器")
-        return None
+        """返回 (ip, port) 或 None。全程有异常保护和日志。"""
+        try:
+            print("[发现] UDP 广播探测中…")
+            udp_results = cls.udp_discover(1.5)
+            for info in udp_results:
+                print(f"[发现] UDP 命中: {info['name']} @ {info['ip']}")
+                return info["ip"], info["port"]
+
+            ips = cls.build_ip_list()
+            if not ips:
+                print("[发现] 未能获取本机 IP，跳过 TCP 扫描")
+                return None
+
+            print(f"[发现] UDP 未命中，自动扫描本机网段 {len(ips)} 个地址 "
+                  f"({', '.join(map(str, Config.SCAN_PORTS))} 端口)…")
+            hit = cls.auto_scan(ips)
+            if hit:
+                print(f"[发现] TCP 命中: {hit[2]} @ {hit[0]}:{hit[1]}")
+                return hit[0], hit[1]
+            print("[发现] 未找到 Daphile/LMS 服务器")
+            return None
+        except Exception as e:
+            print(f"[发现] auto_discover 异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None

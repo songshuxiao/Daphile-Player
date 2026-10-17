@@ -546,5 +546,12 @@ class KaraokeOverlay:
     def hide(self):
         self.root.withdraw()
 
+    def is_visible(self):
+        """浮窗当前是否可见（供控制面板按钮同步状态用）"""
+        try:
+            return bool(self.root.winfo_ismapped())
+        except tk.TclError:
+            return False
+        
     def run(self):
         self.root.mainloop()

@@ -8,6 +8,7 @@
 
 import json
 import time
+import socket
 import threading
 import urllib.request
 import urllib.parse
@@ -23,7 +24,29 @@ class LmsClient:
         self._mac = player_mac or ""
         self.server_name = ""
         self._lock = threading.Lock()
-
+    # ---------- Wake-on-LAN ----------
+    @staticmethod
+    def send_wol(mac, ip="255.255.255.255", port=9):
+        """发送 WOL 魔术包
+           mac : 目标主机网卡 MAC，支持 AA:BB:CC:DD:EE:FF / AA-BB-... / AABBCCDDEEFF
+           ip  : 广播地址，建议子网定向广播（如 192.168.3.255）
+           port: 9 或 7"""
+        try:
+            mac_clean = (mac.replace(":", "").replace("-", "")
+                         .replace(".", "").replace(" ", ""))
+            if len(mac_clean) != 12:
+                raise ValueError(f"MAC 长度错误: {mac!r}")
+            mac_bytes = bytes.fromhex(mac_clean)
+            packet = b"\xff" * 6 + mac_bytes * 16
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.sendto(packet, (ip, port))
+            sock.close()
+            print(f"[WOL] 魔术包已发送: {ip}:{port} (MAC={mac})")
+            return True
+        except Exception as e:
+            print(f"[WOL] 发送失败: {e}")
+            return False
     # ---------- 底层 HTTP ----------
     def _post(self, player, cmd, retries=3):
         url = f"http://{self.host}:{self.port}/jsonrpc.js"
@@ -397,3 +420,40 @@ class LmsClient:
             return text, ""
         except Exception as e:
             return None, str(e)
+
+    # 在 lms_client.py 的 LmsClient 类中添加关机方法
+
+    # 在 lms_client.py 的 LmsClient 类中修改此方法
+
+    def shutdown_daphile(self):
+        """向 Daphile 发送关机请求（Web 界面实际使用的接口）
+        实际请求: GET http://<host>/cgi-bin/Info?ACTION=shutdown （端口 80）"""
+        url = f"http://{self.host}/cgi-bin/Info?ACTION=shutdown"
+        try:
+            print(f"[关机] 发送请求: {url}")
+            req = urllib.request.Request(
+                url, method="GET",
+                headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print(f"[关机] 请求成功 (status={resp.status})")
+                return True
+        except Exception as e:
+            print(f"[关机] 请求失败: {e}")
+            return False
+
+    def get_server_mac(self):
+        """尝试通过LMS的serverstatus命令获取服务器MAC地址"""
+        try:
+            # 发送 serverstatus 请求，并请求包含MAC信息的标签（如 'm' 或 'all'）
+            res = self.command(["serverstatus", 0, 50], player="-")
+            # 在返回结果的根层级或 'server' 对象中查找 mac 字段
+            mac = res.get("mac") or (res.get("server") or {}).get("mac")
+            if mac:
+                print(f"[MAC] LMS serverstatus 返回服务器MAC: {mac}")
+                # 规范化格式
+                clean = mac.replace(":", "").replace("-", "").replace(" ", "").upper()
+                if len(clean) == 12:
+                    return ":".join(clean[i:i+2] for i in range(0, 12, 2))
+        except Exception as e:
+            print(f"[MAC] LMS serverstatus 获取失败: {e}")
+        return ""    

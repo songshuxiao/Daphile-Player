@@ -23,6 +23,178 @@ except ImportError:
     HAS_PIL = False
 
 
+class CanvasSlider(tk.Canvas):
+    """圆角、可拖动的水平滑块，兼容 ttk.Scale 的常用接口（get/set/config）"""
+
+    def __init__(self, parent, from_=0.0, to=100.0, value=0.0,
+                 command=None,
+                 bg="#15151E", trough="#0F0F16",
+                 fill="#5A5AE0", thumb="#E8E8F0",
+                 thumb_hover="#FFFFFF",
+                 height=22, track_height=6, thumb_radius=8,
+                 on_drag_start=None, on_drag_end=None,
+                 **kwargs):
+        super().__init__(parent, bg=bg, highlightthickness=0, bd=0,
+                         height=height, **kwargs)
+        self._from = float(from_)
+        self._to = float(to)
+        self._value = float(value)
+        self._command = command
+        self._on_drag_start = on_drag_start
+        self._on_drag_end = on_drag_end
+        self._trough = trough
+        self._fill = fill
+        self._thumb = thumb
+        self._thumb_hover = thumb_hover
+        self._track_h = track_height
+        self._thumb_r = thumb_radius
+        self._canvas_h = height
+        self._dragging = False
+        self._hover = False
+
+        self.bind("<Configure>", lambda e: self._redraw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.config(cursor="hand2")
+
+    # ---- 兼容 ttk.Scale 的接口 ----
+    def get(self):
+        return self._value
+
+    def set(self, v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return
+        v = max(self._from, min(self._to, v))
+        if abs(v - self._value) < 1e-6:
+            return
+        self._value = v
+        self._redraw()
+
+    def config(self, *args, **kwargs):
+        if "to" in kwargs:
+            new_to = kwargs.pop("to")
+            try:
+                self._to = float(new_to)
+            except (TypeError, ValueError):
+                pass
+            if self._value > self._to:
+                self._value = self._to
+            self._redraw()
+        if "from_" in kwargs:
+            try:
+                self._from = float(kwargs.pop("from_"))
+            except (TypeError, ValueError):
+                pass
+        if args or kwargs:
+            return super().config(*args, **kwargs)
+
+    configure = config
+
+    # ---- 绘制 ----
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        if w < 10:
+            return
+        h = self._canvas_h
+        cy = h // 2
+        r = self._thumb_r
+        th = self._track_h
+
+        x0 = r + 2
+        x1 = w - r - 2
+        if x1 <= x0:
+            return
+
+        span = self._to - self._from
+        ratio = 0.0 if span <= 0 else (self._value - self._from) / span
+        ratio = max(0.0, min(1.0, ratio))
+        thumb_x = x0 + ratio * (x1 - x0)
+
+        # 槽
+        self._round_rect(x0, cy - th // 2, x1, cy + th // 2,
+                         radius=th // 2, fill=self._trough)
+
+        # 已填充
+        if thumb_x > x0 + 1:
+            self._round_rect(x0, cy - th // 2, thumb_x, cy + th // 2,
+                             radius=th // 2, fill=self._fill)
+
+        # 滑块
+        tc = self._thumb_hover if (self._hover or self._dragging) else self._thumb
+        self.create_oval(thumb_x - r, cy - r, thumb_x + r, cy + r,
+                         fill=tc, outline="")
+
+    def _round_rect(self, x1, y1, x2, y2, radius=0, **kwargs):
+        if radius <= 0:
+            self.create_rectangle(x1, y1, x2, y2, **kwargs)
+            return
+        r = radius
+        points = [
+            x1 + r, y1,
+            x2 - r, y1, x2, y1,
+            x2, y1 + r,
+            x2, y2 - r, x2, y2,
+            x2 - r, y2,
+            x1 + r, y2,
+            x1, y2,
+            x1, y2 - r,
+            x1, y1 + r, x1, y1,
+        ]
+        self.create_polygon(points, smooth=True, **kwargs)
+
+    # ---- 交互 ----
+    def _set_from_x(self, x):
+        r = self._thumb_r
+        w = self.winfo_width()
+        x0 = r + 2
+        x1 = w - r - 2
+        if x1 <= x0:
+            return
+        ratio = (x - x0) / (x1 - x0)
+        ratio = max(0.0, min(1.0, ratio))
+        v = self._from + ratio * (self._to - self._from)
+        if abs(v - self._value) < 1e-6:
+            return
+        self._value = v
+        self._redraw()
+        if self._command:
+            try:
+                self._command(str(v))
+            except Exception:
+                pass
+
+    def _on_press(self, e):
+        self._dragging = True
+        if callable(self._on_drag_start):
+            self._on_drag_start()
+        self._set_from_x(e.x)
+
+    def _on_drag(self, e):
+        if self._dragging:
+            self._set_from_x(e.x)
+
+    def _on_release(self, e):
+        was_dragging = self._dragging
+        self._dragging = False
+        self._redraw()
+        if was_dragging and callable(self._on_drag_end):
+            self._on_drag_end()
+
+    def _on_enter(self, e):
+        self._hover = True
+        self._redraw()
+
+    def _on_leave(self, e):
+        self._hover = False
+        self._redraw()
+
+
 class ControlPanel:
 
     BG     = "#15151E"   # 面板底
@@ -49,7 +221,8 @@ class ControlPanel:
         self._fetch_token = 0
         self._playing = False
         self.player_name = ""
-        self._vol_set = False
+        self._vol_dragging = False   # 用户正在拖动音量条，暂不同步远端值
+        self._last_overlay_vis = None   # 用于检测浮窗状态"变化"，避免启动时误写配置
 
         # 专辑封面相关
         self._cover_cache = {}          # cover_id -> PhotoImage
@@ -58,18 +231,28 @@ class ControlPanel:
 
         # 音乐库图标缓存（歌手 / 专辑）
         self._icon_cache = {}
+       
+       # 关机后回调（由 main.py 挂载，用于弹出重连对话框）
+        self.on_daphile_shutdown = None
 
         self._lib_items = {}
         self._lib_stack = []
 
         self.panel = tk.Toplevel(overlay.root)
-        self.panel.title("LMS 控制面板")
-        self.panel.geometry("500x450")
+        self.panel.title("达菲控制面板")
+        self.panel.geometry("500x330")   # 占位，_build_ui 后按内容自适应
         self.panel.configure(bg=self.BG)
 
         self._build_style()
         self._build_ui()
         self._sync_font_controls()
+
+        # ★ 按当前展开状态计算紧凑高度（收起时 290，展开时按内容）
+        self.panel.update_idletasks()
+        try:
+            self.panel.geometry(f"500x{self._calc_panel_height()}")
+        except tk.TclError:
+            pass
 
         self._stop = False
         threading.Thread(target=self._poll_loop, daemon=True).start()
@@ -144,9 +327,19 @@ class ControlPanel:
         style.configure("Treeview.Heading", background=self.CARD,
                         foreground=self.DIM, relief="flat")
 
-        # Scrollbar
-        style.configure("Vertical.TScrollbar", background=self.CARD,
-                        troughcolor=self.BG, arrowcolor=self.FG)
+        # Scrollbar（音乐库）：窄槽、圆润滑块、隐藏箭头
+        style.configure("Custom.Vertical.TScrollbar",
+                        background=self.SEL_BG,
+                        troughcolor=self.FIELD,
+                        bordercolor=self.FIELD,
+                        arrowcolor=self.FIELD,
+                        arrowsize=0,
+                        width=8,
+                        gripcount=0)
+        style.map("Custom.Vertical.TScrollbar",
+                  background=[("active", self.ACCENT),
+                              ("pressed", self.ACCENT)],
+                  arrowcolor=[("active", self.FIELD)])
 
     # ================= UI 构建 =================
     def _build_ui(self):
@@ -175,9 +368,28 @@ class ControlPanel:
         nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.nb = nb
 
+        # ★ 标签栏右上角按钮组：歌词显示切换 + 关机（并排放在同一个 Frame 内）
+        btn_group = tk.Frame(nb, bg=self.BG)
+        btn_group.place(relx=1.0, x=-8, y=10, anchor="ne")
+
+        self.btn_settings = self._make_round_btn(
+            btn_group, "⚙ 设置", self._toggle_lyrics_panel,
+            width=64, height=22, radius=8)
+        self.btn_settings.pack(side="left", padx=(0, 6))
+
+        self.btn_lyrics = self._make_round_btn(
+            btn_group, "● 桌面歌词", self._toggle_lyrics,
+            width=80, height=22, radius=8)
+        self.btn_lyrics.pack(side="left", padx=(0, 6))
+
+        self.btn_shutdown = self._make_round_btn(
+            btn_group, "⏻ 关闭达菲", self._shutdown_daphile,
+            width=80, height=22, radius=8)
+        self.btn_shutdown.pack(side="left")
+
         # ================= TAB 1：正在播放 =================
         f1 = ttk.Frame(nb, padding=10)
-        nb.add(f1, text="正在播放 ")
+        nb.add(f1, text="播放中")
 
         card = tk.Frame(f1, bg=self.CARD)
         card.pack(fill="x", pady=(0, 8))
@@ -206,34 +418,63 @@ class ControlPanel:
                                  fg=self.DIM, font=("Consolas", 10))
         self.lbl_time.pack(anchor="w")
 
-        # ---- 进度条（可拖动） ----
-        self.progress = ttk.Scale(f1, from_=0, to=100, orient="horizontal")
+        # ---- 进度条（可拖动，自定义圆角滑块） ----
+        self.progress = CanvasSlider(
+            f1, from_=0, to=100, value=0,
+            bg=self.BG,
+            trough="#0F0F16",
+            fill=self.ACCENT,
+            thumb=self.FG,
+            thumb_hover="#FFFFFF",
+            height=22, track_height=6, thumb_radius=8,
+            on_drag_start=self._seek_start,
+            on_drag_end=self._seek_end)
         self.progress.pack(fill="x", pady=(4, 0))
-        self.progress.bind("<ButtonPress-1>", lambda _e: self._seek_start())
-        self.progress.bind("<ButtonRelease-1>", self._seek_end)
 
+        # 播放控制按钮组：居中 + 圆形按钮
         ctl = tk.Frame(f1, bg=self.BG)
-        ctl.pack(fill="x", pady=6)
-        self.btn_prev = self._mk_btn(ctl, "⏮", lambda: self._cmd("prev"))
-        self.btn_play = self._mk_btn(ctl, "▶", self._toggle_play, width=5)
-        self.btn_next = self._mk_btn(ctl, "⏭", lambda: self._cmd("next"))
-        self.btn_prev.pack(side="left", padx=(0, 6))
-        self.btn_play.pack(side="left", padx=6)
-        self.btn_next.pack(side="left", padx=6)
+        ctl.pack(pady=(10, 6))          # 不加 fill="x"，pack 默认居中
+
+        self.btn_prev = self._make_play_btn(
+            ctl, "◀◀", lambda: self._cmd("prev"),
+            diameter=38, font_size=10, primary=False)
+        self.btn_prev.pack(side="left", padx=8)
+
+        self.btn_play = self._make_play_btn(
+            ctl, "▶", self._toggle_play,
+            diameter=54, font_size=18, primary=True)
+        self.btn_play.pack(side="left", padx=8)
+
+        self.btn_next = self._make_play_btn(
+            ctl, "▶▶", lambda: self._cmd("next"),
+            diameter=38, font_size=10, primary=False)
+        self.btn_next.pack(side="left", padx=8)
 
         vol_row = tk.Frame(f1, bg=self.BG)
         vol_row.pack(fill="x", pady=(0, 10))
         tk.Label(vol_row, text="音量", bg=self.BG, fg=self.DIM,
                  font=("Microsoft YaHei UI", 9)).pack(side="left")
-        self.scl_vol = ttk.Scale(vol_row, from_=0, to=100, orient="horizontal",
-                                 command=self._on_volume)
+        self.scl_vol = CanvasSlider(
+            vol_row, from_=0, to=100, value=50,
+            bg=self.BG,
+            trough="#0F0F16",
+            fill=self.ACCENT,
+            thumb=self.FG,
+            thumb_hover="#FFFFFF",
+            height=22, track_height=6, thumb_radius=8,
+            command=self._on_volume,
+            on_drag_start=self._on_vol_drag_start,
+            on_drag_end=self._on_vol_drag_end)
         self.scl_vol.pack(side="left", fill="x", expand=True, padx=8)
 
-        # ---- 歌词外观 ----
-        ap = tk.LabelFrame(f1, text=" 歌词外观 ", bg=self.CARD, fg=self.FG)
-        ap.pack(fill="x")
 
-        r0 = tk.Frame(ap, bg=self.CARD)
+        # ---- 歌词外观（默认隐藏，点设置按钮后显示） ----
+        self.ap = tk.LabelFrame(f1, text=" 歌词外观 ",
+                                bg=self.CARD, fg=self.FG)
+        # 默认不 pack，等用户点 ⚙ 设置 后再 pack
+        self._lyrics_appearance_visible = False
+
+        r0 = tk.Frame(self.ap, bg=self.CARD)
         r0.pack(fill="x", padx=10, pady=(8, 4))
         tk.Label(r0, text="字体", bg=self.CARD, fg=self.DIM,
                  font=("Microsoft YaHei UI", 9)).pack(side="left")
@@ -248,29 +489,23 @@ class ControlPanel:
                                    insertbackground=self.FG)
         self.spn_size.pack(side="left", padx=4)
 
-        r1 = tk.Frame(ap, bg=self.CARD)
-        r1.pack(fill="x", padx=10, pady=(4, 10))
-        tk.Label(r1, text="已唱色", bg=self.CARD, fg=self.DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
-        self.btn_c_active = tk.Button(r1, width=6, relief="flat",
-                                      bg=self.cfg.COLOR_ACTIVE,
-                                      activebackground=self.SEL_BG,
-                                      command=lambda: self._pick_color("COLOR_ACTIVE"))
-        self.btn_c_active.pack(side="left", padx=4)
-        tk.Label(r1, text="未唱色", bg=self.CARD, fg=self.DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(16, 0))
-        self.btn_c_idle = tk.Button(r1, width=6, relief="flat",
-                                    bg=self.cfg.COLOR_IDLE,
-                                    activebackground=self.SEL_BG,
-                                    command=lambda: self._pick_color("COLOR_IDLE"))
-        self.btn_c_idle.pack(side="left", padx=4)
-        tk.Label(r1, text="描边色", bg=self.CARD, fg=self.DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(16, 0))
-        self.btn_c_stroke = tk.Button(r1, width=6, relief="flat",
-                                      bg=self.cfg.COLOR_STROKE,
-                                      activebackground=self.SEL_BG,
-                                      command=lambda: self._pick_color("COLOR_STROKE"))
-        self.btn_c_stroke.pack(side="left", padx=4)
+        r1 = tk.Frame(self.ap, bg=self.CARD)
+        r1.pack(fill="x", padx=10, pady=(6, 10))
+        # 三列等宽，色块组均匀分布
+        for col in range(3):
+            r1.columnconfigure(col, weight=1)
+
+        frame_a, self._swatch_active = self._make_color_swatch(
+            r1, "COLOR_ACTIVE", "已唱色")
+        frame_a.grid(row=0, column=0, sticky="w")
+
+        frame_b, self._swatch_idle = self._make_color_swatch(
+            r1, "COLOR_IDLE", "未唱色")
+        frame_b.grid(row=0, column=1, sticky="w")
+
+        frame_c, self._swatch_stroke = self._make_color_swatch(
+            r1, "COLOR_STROKE", "描边色")
+        frame_c.grid(row=0, column=2, sticky="w")
 
         # ================= TAB 2：音乐库 =================
         f2 = ttk.Frame(nb, padding=10)
@@ -292,8 +527,10 @@ class ControlPanel:
 
         mid = tk.Frame(f2, bg=self.BG)
         mid.pack(fill="both", expand=True)
-        sb = ttk.Scrollbar(mid, orient="vertical")
+        sb = ttk.Scrollbar(mid, orient="vertical",
+                           style="Custom.Vertical.TScrollbar")
         self.tree = ttk.Treeview(mid, show="tree", selectmode="extended",
+                                 height=6,          # ★ 默认 6 行，避免撑高整个面板
                                  yscrollcommand=sb.set)
         sb.config(command=self.tree.yview)
         sb.pack(side="right", fill="y")
@@ -332,11 +569,62 @@ class ControlPanel:
         except Exception:
             traceback.print_exc()
 
+    def _toggle_lyrics(self):
+        """切换桌面歌词浮窗的显示 / 隐藏，并持久化到配置"""
+        try:
+            if self.overlay.is_visible():
+                self.overlay.hide()
+                self.btn_lyrics.set_text("○ 桌面歌词")
+                self.cfg.OVERLAY_VISIBLE = False
+            else:
+                self.overlay.show()
+                self.btn_lyrics.set_text("● 桌面歌词")
+                self.cfg.OVERLAY_VISIBLE = True
+            self.cfg.save()
+        except Exception:
+            traceback.print_exc()
+    
+    def _calc_panel_height(self):
+        """返回合适的窗口高度：
+           · 展开歌词外观 → 固定 480（内容自适应偏麻烦，直接给够）
+           · 收起歌词外观 → 固定 360，所有控件完整可见"""
+        if self._lyrics_appearance_visible:
+            return 480
+        return 360
+    
+    def _toggle_lyrics_panel(self):
+        """切换歌词外观设置面板的显示 / 隐藏，并按状态调整窗口高度"""
+        if self._lyrics_appearance_visible:
+            self.ap.pack_forget()
+            self._lyrics_appearance_visible = False
+            self.btn_settings.set_text("⚙ 外观")
+        else:
+            self.ap.pack(fill="x")
+            self._lyrics_appearance_visible = True
+            self.btn_settings.set_text("⚙ 外观")
+
+        self.panel.update_idletasks()
+        try:
+            self.panel.geometry(f"500x{self._calc_panel_height()}")
+        except tk.TclError:
+            pass
+
     def _on_volume(self, val):
         try:
             self.lms.command(["mixer", "volume", str(int(float(val)))])
         except Exception:
             pass
+    
+    def _on_vol_drag_start(self):
+        """用户开始拖动音量条：暂停远端同步，避免和拖动打架"""
+        self._vol_dragging = True
+
+    def _on_vol_drag_end(self):
+        """用户松手：延迟 300ms 再恢复同步，给 LMS 处理新值的时间"""
+        self.panel.after(300, self._end_vol_drag)
+
+    def _end_vol_drag(self):
+        self._vol_dragging = False
 
     # ---- 进度条拖动 ----
     def _seek_start(self):
@@ -391,15 +679,16 @@ class ControlPanel:
                                                title="选择歌词颜色")
         if hexcolor:
             setattr(self.cfg, key, hexcolor)
-            btn_map = {
-                "COLOR_ACTIVE": self.btn_c_active,
-                "COLOR_IDLE":   self.btn_c_idle,
-                "COLOR_STROKE": self.btn_c_stroke,
-            }
-            btn = btn_map.get(key)
-            if btn:
-                btn.config(bg=hexcolor)
             self.cfg.save()
+            # 刷新对应色块
+            swatch_map = {
+                "COLOR_ACTIVE": self._swatch_active,
+                "COLOR_IDLE":   self._swatch_idle,
+                "COLOR_STROKE": self._swatch_stroke,
+            }
+            sw = swatch_map.get(key)
+            if sw:
+                sw()
             self.overlay.set_line(self._line_text(), self._next_text(),
                                   self.track_info.get("title", ""))
 
@@ -412,10 +701,12 @@ class ControlPanel:
                 self.song_pos = st.get("time", 0.0)
                 self._duration = st.get("duration", 0.0)
                 self._playing = st.get("mode") == "play"
-                if not self._vol_set and "volume" in st:
+                # ★ 每轮都同步远端音量（用户正在拖动时跳过）
+                if "volume" in st and not self._vol_dragging:
                     try:
-                        self.scl_vol.set(float(st["volume"]))
-                        self._vol_set = True
+                        v = float(st["volume"])
+                        if abs(v - float(self.scl_vol.get())) > 0.5:
+                            self.scl_vol.set(v)
                     except (TypeError, ValueError):
                         pass
                 tid = st.get("track_id")
@@ -607,7 +898,7 @@ class ControlPanel:
         self.lbl_artist.config(text=artist)
         self.lbl_time.config(text=f"{self._fmt(self.song_pos)} / "
                                   f"{self._fmt(self._duration)}")
-        self.btn_play.config(text="⏸" if self._playing else "▶")
+        self.btn_play.set_text("⏸" if self._playing else "▶")
         if self.player_name:
             self.lbl_player.config(text=f"播放器: {self.player_name}")
 
@@ -638,6 +929,21 @@ class ControlPanel:
         else:
             t = info.get("title", "")
             self.overlay.clear(t, message=f"{t}" if t else "")
+        # 同步歌词按钮文字（浮窗也可能被右键菜单直接隐藏/显示）
+        try:
+            vis = self.overlay.is_visible()
+            self.btn_lyrics.set_text("● 桌面歌词" if vis else "○ 桌面歌词")
+            # ★ 只在"状态发生变化"时写配置：
+            #   第一次 tick 只记录初始状态，不写盘，
+            #   避免启动时 overlay 还没按配置 show 就被误判为"用户隐藏"。
+            if self._last_overlay_vis is None:
+                self._last_overlay_vis = vis
+            elif self._last_overlay_vis != vis:
+                self._last_overlay_vis = vis
+                self.cfg.OVERLAY_VISIBLE = vis
+                self.cfg.save()
+        except Exception:
+            pass
 
     @staticmethod
     def _fmt(sec):
@@ -840,3 +1146,336 @@ class ControlPanel:
         self._cover_cache.clear()
         self._cover_photo = None
         self._icon_cache.clear()
+
+    # 在 control_panel.py 的 ControlPanel 类中添加
+
+    def _shutdown_daphile(self):
+        """关机确认与执行"""
+        from tkinter import messagebox
+        
+        # 二次确认
+        confirm = messagebox.askyesno(
+            "确认关机",
+            "确定要关闭达菲设备吗？\n\n"
+            "关机后设备将完全断电，需要手动重新开机。",
+            parent=self.panel
+        )
+        if not confirm:
+            return
+        
+        # 禁用按钮，防止重复点击
+        self.btn_shutdown.set_state(False)
+        self.btn_shutdown.set_text("正在关机…")
+        self._lib_set_status("正在向达菲发送关机指令…")
+
+        # 在后台线程执行，避免阻塞 UI
+        def work():
+            ok = self.lms.shutdown_daphile()
+            def apply():
+                if ok:
+                    self._lib_set_status("关机指令已发送，设备即将关闭")
+                    self.btn_shutdown.set_text("已发送指令")
+                    # 延迟 2 秒后触发重连流程，让状态文字先显示出来
+                    self.panel.after(2000, self._after_shutdown)
+                else:
+                    self._lib_set_status("关机失败，请检查网络连接")
+                    self.btn_shutdown.set_text("⏻ 关闭达菲")
+                    self.btn_shutdown.set_state(True)
+            self.panel.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+    
+    def _after_shutdown(self):
+        """关机成功后：通知 main.py 弹出重连对话框"""
+        if callable(self.on_daphile_shutdown):
+            try:
+                self.on_daphile_shutdown()
+            except Exception:
+                traceback.print_exc()
+
+    def reconnect(self, lms, fetcher, player_name, server_label):
+        """主流程重连成功后，更新内部引用并恢复界面。
+           poll_loop 每轮都读 self.lms，引用更新后下个周期就切到新连接。"""
+        self.lms = lms
+        self.fetcher = fetcher
+        self.player_name = player_name or ""
+        self.lbl_server.config(text=server_label)
+
+        # 重置封面 / 歌词状态，避免旧数据残留
+        self._current_cover_id = ""
+        self._cover_cache.clear()
+        self._cover_photo = None
+        self.lines = []
+        self.cur_line_idx = -1
+        self._lyrics_source = ""
+        self.track_info = {}
+
+        # 重置关机按钮
+        try:
+            self.btn_shutdown.set_text("⏻ 关闭达菲")
+            self.btn_shutdown.set_state(True)
+        except Exception:
+            pass
+
+                # 显示主界面
+        try:
+            self.panel.deiconify()
+            self.panel.lift()
+        except tk.TclError:
+            pass
+
+        # 浮窗按配置恢复显隐
+        try:
+            if getattr(self.cfg, "OVERLAY_VISIBLE", True):
+                self.overlay.show()
+                self.btn_lyrics.set_text("● 桌面歌词")
+            else:
+                self.overlay.hide()
+                self.btn_lyrics.set_text("○ 桌面歌词")
+        except Exception:
+            pass
+
+    # ================= 美化控件工厂 =================
+    def _make_round_btn(self, parent, text, cmd,
+                        width=112, height=22, radius=8):
+        """Canvas 圆角矩形按钮。返回 canvas，附带 set_text / set_state 方法"""
+        canvas = tk.Canvas(parent, width=width, height=height,
+                           bg=self.BG, highlightthickness=0, bd=0)
+        state = {"text": text, "hover": False, "enabled": True}
+
+        def redraw():
+            canvas.delete("all")
+            bg_color = self.SEL_BG if state["hover"] else self.CARD
+            fg_color = self.FG if state["enabled"] else self.DIM
+            r = radius
+            w, h = width, height
+            # 四角圆弧
+            canvas.create_arc(0, 0, 2 * r, 2 * r, start=90, extent=90,
+                              fill=bg_color, outline=bg_color)
+            canvas.create_arc(w - 2 * r, 0, w, 2 * r, start=0, extent=90,
+                              fill=bg_color, outline=bg_color)
+            canvas.create_arc(0, h - 2 * r, 2 * r, h, start=180, extent=90,
+                              fill=bg_color, outline=bg_color)
+            canvas.create_arc(w - 2 * r, h - 2 * r, w, h,
+                              start=270, extent=90,
+                              fill=bg_color, outline=bg_color)
+            # 中间矩形
+            canvas.create_rectangle(r, 0, w - r, h,
+                                    fill=bg_color, outline=bg_color)
+            canvas.create_rectangle(0, r, w, h - r,
+                                    fill=bg_color, outline=bg_color)
+            # 文字
+            canvas.create_text(w // 2, h // 2, text=state["text"],
+                               fill=fg_color,
+                               font=("Microsoft YaHei UI", 9))
+
+        def on_click(_e):
+            if state["enabled"]:
+                cmd()
+
+        def set_text(t):
+            if state["text"] == t:
+                return
+            state["text"] = t
+            redraw()
+
+        def set_state(enabled):
+            state["enabled"] = enabled
+            redraw()
+
+        def on_enter(_e):
+            state["hover"] = True
+            redraw()
+
+        def on_leave(_e):
+            state["hover"] = False
+            redraw()
+
+        redraw()
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Enter>", on_enter)
+        canvas.bind("<Leave>", on_leave)
+        canvas.config(cursor="hand2")
+        canvas.set_text = set_text
+        canvas.set_state = set_state
+        return canvas
+
+    def _get_circle_photo(self, diameter, color):
+        """Pillow 超采样生成抗锯齿圆，按 (直径, 颜色) 缓存。
+           失败（无 PIL）时返回 None，调用方回退 Canvas 圆。"""
+        if not hasattr(self, "_circle_cache"):
+            self._circle_cache = {}
+        key = (diameter, color)
+        if key in self._circle_cache:
+            return self._circle_cache[key]
+        if not HAS_PIL:
+            return None
+        try:
+            ss = 4                          # 4 倍超采样
+            big = Image.new("RGB", (diameter * ss, diameter * ss), self.BG)
+            bd = ImageDraw.Draw(big)
+            bd.ellipse((0, 0, diameter * ss - 1, diameter * ss - 1),
+                       fill=color)
+            small = big.resize((diameter, diameter), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(small)
+            self._circle_cache[key] = photo
+            return photo
+        except Exception:
+            return None
+        
+    def _make_play_btn(self, parent, text, cmd,
+                       diameter=50, font_size=16, primary=False):
+        """圆形播放控制按钮。
+           · 圆形用 Pillow 超采样渲染（抗锯齿边缘）
+           · ▶ ⏸ ◀◀ ▶▶ 全部几何图形绘制，三角形按 bbox 居中 +
+             视觉质心微补偿，播放键精确在圆心"""
+        canvas = tk.Canvas(parent, width=diameter, height=diameter,
+                           bg=self.BG, highlightthickness=0, bd=0)
+        state = {"text": text, "hover": False}
+
+        def redraw():
+            canvas.delete("all")
+            d = diameter
+            c = d / 2
+
+            if primary:
+                fill = "#7A7AFF" if state["hover"] else self.ACCENT
+                fg = "#FFFFFF"
+            else:
+                fill = self.SEL_BG if state["hover"] else self.CARD
+                fg = self.FG
+
+            # ---- 抗锯齿圆 ----
+            photo = self._get_circle_photo(d, fill)
+            if photo is not None:
+                canvas.create_image(c, c, image=photo)
+                canvas._circle_photo = photo   # 保引用防 GC
+            else:
+                canvas.create_oval(1, 1, d - 1, d - 1, fill=fill, outline="")
+
+            txt = state["text"]
+
+            # ---- 图标 ----
+            if txt == "▶":
+                # 三角形：bbox 严格居中于 c，
+                # x 方向右移 tri_w*0.1 补偿视觉质心偏左（右尖更显眼）
+                tri_w = font_size * 0.85
+                tri_h = font_size * 1.05
+                ox = tri_w * 0.1
+                canvas.create_polygon(
+                    c - tri_w / 2 + ox, c - tri_h / 2,
+                    c - tri_w / 2 + ox, c + tri_h / 2,
+                    c + tri_w / 2 + ox, c,
+                    fill=fg, outline="")
+
+            elif txt == "⏸":
+                bar_w = max(2, font_size * 0.22)
+                bar_h = font_size * 0.85
+                gap = max(2, font_size * 0.18)
+                total = bar_w * 2 + gap
+                sx = c - total / 2
+                canvas.create_rectangle(
+                    sx, c - bar_h / 2, sx + bar_w, c + bar_h / 2,
+                    fill=fg, outline="")
+                canvas.create_rectangle(
+                    sx + bar_w + gap, c - bar_h / 2,
+                    sx + bar_w * 2 + gap, c + bar_h / 2,
+                    fill=fg, outline="")
+
+            elif txt in ("◀◀", "▶▶"):
+                tri_w = font_size * 0.9
+                tri_h = font_size * 1.1
+                gap = font_size * 0.25
+                total = tri_w * 2 + gap
+                sx = c - total / 2
+                for i in range(2):
+                    tx = sx + i * (tri_w + gap)
+                    if txt == "◀◀":
+                        canvas.create_polygon(
+                            tx, c,
+                            tx + tri_w, c - tri_h / 2,
+                            tx + tri_w, c + tri_h / 2,
+                            fill=fg, outline="")
+                    else:
+                        canvas.create_polygon(
+                            tx, c - tri_h / 2,
+                            tx, c + tri_h / 2,
+                            tx + tri_w, c,
+                            fill=fg, outline="")
+            else:
+                canvas.create_text(c, c, text=txt, fill=fg,
+                                   font=("Microsoft YaHei UI", font_size))
+
+        def on_click(_e):
+            cmd()
+
+        def on_enter(_e):
+            state["hover"] = True
+            redraw()
+
+        def on_leave(_e):
+            state["hover"] = False
+            redraw()
+
+        def set_text(t):
+            if state["text"] == t:
+                return
+            state["text"] = t
+            redraw()
+
+        redraw()
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Enter>", on_enter)
+        canvas.bind("<Leave>", on_leave)
+        canvas.config(cursor="hand2")
+        canvas.set_text = set_text
+        return canvas
+
+    def _make_color_swatch(self, parent, color_key, label_text):
+        """标签在左、圆角正方形色块在右，横向排列。
+           返回 (frame, refresh_callback)"""
+        frame = tk.Frame(parent, bg=self.CARD)
+
+        tk.Label(frame, text=label_text, bg=self.CARD, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left",
+                                                     padx=(0, 6))
+
+        # 22×22 圆角正方形色块
+        canvas = tk.Canvas(frame, width=22, height=22,
+                           bg=self.CARD, highlightthickness=0, bd=0)
+        canvas.pack(side="left")
+
+        state = {"hover": False}
+
+        def redraw():
+            canvas.delete("all")
+            color = getattr(self.cfg, color_key)
+            border = "#FFFFFF" if state["hover"] else "#5A5A78"
+            x1, y1, x2, y2 = 1, 1, 21, 21
+            r = 6
+            points = [
+                x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+                x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+                x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+            ]
+            canvas.create_polygon(points, smooth=True,
+                                  fill=color, outline=border, width=2)
+
+        def on_click(_e):
+            self._pick_color(color_key)
+
+        def on_enter(_e):
+            state["hover"] = True
+            redraw()
+
+        def on_leave(_e):
+            state["hover"] = False
+            redraw()
+
+        redraw()
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Enter>", on_enter)
+        canvas.bind("<Leave>", on_leave)
+        canvas.config(cursor="hand2")
+
+        return frame, redraw
