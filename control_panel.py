@@ -4,15 +4,22 @@
    · 上/下一曲走 lms.prev_track / next_track（同专辑→同歌手→队列顺序）
    · 字体/颜色修改即时保存到 user-config.json
    · 正在播放卡片右侧显示专辑封面（无封面显示默认唱片图标）
-   · 音乐库中歌手行带话筒图标，专辑行带唱片图标（Pillow 绘制，字体无关）"""
+   · 音乐库：三列并排（歌手 / 专辑 / 歌曲），单击歌手→展开专辑，
+     单击专辑→展开歌曲，双击歌曲播放；无滚动条，滚轮可直接滚动
+   · 歌词外观右下角（框外）"关于"按钮：显示版本号、GitHub 链接、检查更新
+   · 启动后自动检测更新，发现新版本提示去下载"""
 
+import os
+import sys
+import json
 import threading
 import time
 import traceback
 import urllib.request
-from io import BytesIO
+import webbrowser
 import tkinter as tk
-from tkinter import ttk, colorchooser, font as tkfont
+from tkinter import ttk, colorchooser, messagebox, font as tkfont
+from io import BytesIO
 
 from lrc_parser import LrcParser
 
@@ -23,8 +30,20 @@ except ImportError:
     HAS_PIL = False
 
 
+APP_VERSION = "v3.0.0"
+APP_REPO = "songshuxiao/Daphile-Player"
+GITHUB_URL = f"https://github.com/{APP_REPO}"
+RELEASES_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
+DOWNLOAD_URL = "https://cloud.szfx.top/Windows/235.html"
+
+
+def _resource_path(name):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
 class CanvasSlider(tk.Canvas):
-    """圆角、可拖动的水平滑块，兼容 ttk.Scale 的常用接口（get/set/config）"""
+    """圆角、可拖动的水平滑块，兼容 ttk.Scale 的常用接口"""
 
     def __init__(self, parent, from_=0.0, to=100.0, value=0.0,
                  command=None,
@@ -60,7 +79,6 @@ class CanvasSlider(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.config(cursor="hand2")
 
-    # ---- 兼容 ttk.Scale 的接口 ----
     def get(self):
         return self._value
 
@@ -95,7 +113,6 @@ class CanvasSlider(tk.Canvas):
 
     configure = config
 
-    # ---- 绘制 ----
     def _redraw(self):
         self.delete("all")
         w = self.winfo_width()
@@ -116,16 +133,12 @@ class CanvasSlider(tk.Canvas):
         ratio = max(0.0, min(1.0, ratio))
         thumb_x = x0 + ratio * (x1 - x0)
 
-        # 槽
         self._round_rect(x0, cy - th // 2, x1, cy + th // 2,
                          radius=th // 2, fill=self._trough)
-
-        # 已填充
         if thumb_x > x0 + 1:
             self._round_rect(x0, cy - th // 2, thumb_x, cy + th // 2,
                              radius=th // 2, fill=self._fill)
 
-        # 滑块
         tc = self._thumb_hover if (self._hover or self._dragging) else self._thumb
         self.create_oval(thumb_x - r, cy - r, thumb_x + r, cy + r,
                          fill=tc, outline="")
@@ -136,19 +149,12 @@ class CanvasSlider(tk.Canvas):
             return
         r = radius
         points = [
-            x1 + r, y1,
-            x2 - r, y1, x2, y1,
-            x2, y1 + r,
-            x2, y2 - r, x2, y2,
-            x2 - r, y2,
-            x1 + r, y2,
-            x1, y2,
-            x1, y2 - r,
-            x1, y1 + r, x1, y1,
+            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
         ]
         self.create_polygon(points, smooth=True, **kwargs)
 
-    # ---- 交互 ----
     def _set_from_x(self, x):
         r = self._thumb_r
         w = self.winfo_width()
@@ -197,13 +203,13 @@ class CanvasSlider(tk.Canvas):
 
 class ControlPanel:
 
-    BG     = "#15151E"   # 面板底
-    CARD   = "#20202E"   # 卡片底
-    FIELD  = "#1A1A24"   # 输入控件底（近黑）
-    FG     = "#E8E8F0"   # 主文字
-    DIM    = "#9A9AB0"   # 次要文字
-    SEL_BG = "#3D3D5C"   # 选中底
-    ACCENT = "#5A5AE0"   # 强调色
+    BG     = "#15151E"
+    CARD   = "#20202E"
+    FIELD  = "#1A1A24"
+    FG     = "#E8E8F0"
+    DIM    = "#9A9AB0"
+    SEL_BG = "#3D3D5C"
+    ACCENT = "#5A5AE0"
 
     def __init__(self, lms, overlay, fetcher, cfg):
         self.lms = lms
@@ -221,33 +227,37 @@ class ControlPanel:
         self._fetch_token = 0
         self._playing = False
         self.player_name = ""
-        self._vol_dragging = False   # 用户正在拖动音量条，暂不同步远端值
-        self._last_overlay_vis = None   # 用于检测浮窗状态"变化"，避免启动时误写配置
+        self._vol_dragging = False
+        self._last_overlay_vis = None
 
-        # 专辑封面相关
-        self._cover_cache = {}          # cover_id -> PhotoImage
+        self._cover_cache = {}
         self._current_cover_id = ""
-        self._cover_photo = None        # 保持引用，防 GC
-
-        # 音乐库图标缓存（歌手 / 专辑）
+        self._cover_photo = None
         self._icon_cache = {}
-       
-       # 关机后回调（由 main.py 挂载，用于弹出重连对话框）
+
         self.on_daphile_shutdown = None
 
-        self._lib_items = {}
-        self._lib_stack = []
+        self._lib_artists = {}
+        self._lib_albums = {}
+        self._lib_tracks = {}
+
+        self._lib_artist_token = 0
+        self._lib_album_token = 0
+        self._lib_track_token = 0
+
+        self._update_checking = False
+        self._about_status_lbl = None
+        self._about_auto_toggle = None
 
         self.panel = tk.Toplevel(overlay.root)
-        self.panel.title("达菲控制面板")
-        self.panel.geometry("500x330")   # 占位，_build_ui 后按内容自适应
+        self.panel.title("达菲播放器")
+        self.panel.geometry("500x365")
         self.panel.configure(bg=self.BG)
 
         self._build_style()
         self._build_ui()
         self._sync_font_controls()
 
-        # ★ 按当前展开状态计算紧凑高度（收起时 290，展开时按内容）
         self.panel.update_idletasks()
         try:
             self.panel.geometry(f"500x{self._calc_panel_height()}")
@@ -257,6 +267,10 @@ class ControlPanel:
         self._stop = False
         threading.Thread(target=self._poll_loop, daemon=True).start()
         self._ui_tick_loop()
+
+        # 按用户配置决定是否启动后自动检查更新
+        if getattr(self.cfg, "AUTO_CHECK_UPDATE", True):
+            self.panel.after(3000, lambda: self._check_update(auto=True))
 
     # ================= 样式 =================
     def _build_style(self):
@@ -268,21 +282,18 @@ class ControlPanel:
 
         style.configure(".", background=self.BG, foreground=self.FG,
                         fieldbackground=self.FIELD, borderwidth=0)
-
         style.configure("TFrame", background=self.BG)
         style.configure("Card.TFrame", background=self.CARD)
         style.configure("TLabel", background=self.BG, foreground=self.FG)
         style.configure("Card.TLabel", background=self.CARD, foreground=self.FG)
         style.configure("Dim.TLabel", background=self.BG, foreground=self.DIM)
 
-        # 按钮
         style.configure("TButton", background=self.CARD, foreground=self.FG,
                         padding=(8, 4))
         style.map("TButton",
                   background=[("active", self.SEL_BG), ("pressed", self.ACCENT)],
                   foreground=[("active", self.FG)])
 
-        # Notebook / Tab
         style.configure("TNotebook", background=self.BG, borderwidth=0)
         style.configure("TNotebook.Tab", background=self.CARD, foreground=self.FG,
                         padding=(15, 6), font=("Microsoft YaHei UI", 10))
@@ -292,7 +303,6 @@ class ControlPanel:
                   padding=[("selected", (17, 8)), ("!selected", (15, 6))],
                   expand=[("selected", [1, 0, 1, 0])])
 
-        # Combobox：readonly 状态必须 map 单独映射，否则白底
         style.configure("TCombobox", fieldbackground=self.FIELD,
                         foreground=self.FG, background=self.CARD,
                         arrowcolor=self.FG)
@@ -303,7 +313,6 @@ class ControlPanel:
                   selectbackground=[("readonly", self.FIELD)],
                   selectforeground=[("readonly", self.FG)])
 
-        # Entry：全状态深底
         style.configure("TEntry", fieldbackground=self.FIELD,
                         foreground=self.FG, insertcolor=self.FG)
         style.map("TEntry",
@@ -314,47 +323,31 @@ class ControlPanel:
                   foreground=[("disabled", self.FG), ("readonly", self.FG),
                               ("focus", self.FG)])
 
-        # Scale（音量/进度条）
         style.configure("Horizontal.TScale", background=self.CARD,
                         troughcolor=self.FIELD)
 
-        # Treeview（音乐库列表）
-        style.configure("Treeview", background=self.FIELD, foreground=self.FG,
-                        fieldbackground=self.FIELD, rowheight=26, borderwidth=0)
-        style.map("Treeview",
+        # 音乐库 Treeview：完全无边框、无表头
+        style.configure("Library.Treeview",
+                        background=self.FIELD, foreground=self.FG,
+                        fieldbackground=self.FIELD, rowheight=26,
+                        borderwidth=0, relief="flat")
+        style.map("Library.Treeview",
                   background=[("selected", self.SEL_BG)],
                   foreground=[("selected", "#FFFFFF")])
-        style.configure("Treeview.Heading", background=self.CARD,
-                        foreground=self.DIM, relief="flat")
-
-        # Scrollbar（音乐库）：窄槽、圆润滑块、隐藏箭头
-        style.configure("Custom.Vertical.TScrollbar",
-                        background=self.SEL_BG,
-                        troughcolor=self.FIELD,
-                        bordercolor=self.FIELD,
-                        arrowcolor=self.FIELD,
-                        arrowsize=0,
-                        width=8,
-                        gripcount=0)
-        style.map("Custom.Vertical.TScrollbar",
-                  background=[("active", self.ACCENT),
-                              ("pressed", self.ACCENT)],
-                  arrowcolor=[("active", self.FIELD)])
+        style.layout("Library.Treeview", [
+            ("Library.Treeview.treearea", {"sticky": "nswe"})
+        ])
+        style.configure("Library.Treeview.Heading", background=self.CARD,
+                        foreground=self.DIM, relief="flat", borderwidth=0)
 
     # ================= UI 构建 =================
     def _build_ui(self):
         p = self.panel
-        # 弹出列表配色（下拉框 / 列表框）
         p.option_add("*TCombobox*Listbox.background", self.FIELD)
         p.option_add("*TCombobox*Listbox.foreground", self.FG)
         p.option_add("*TCombobox*Listbox.selectBackground", self.SEL_BG)
         p.option_add("*TCombobox*Listbox.selectForeground", self.FG)
-        p.option_add("*Listbox.background", self.FIELD)
-        p.option_add("*Listbox.foreground", self.FG)
-        p.option_add("*Listbox.selectBackground", self.SEL_BG)
-        p.option_add("*Listbox.selectForeground", "#FFFFFF")
 
-        # ---- 顶栏 ----
         head = tk.Frame(p, bg=self.BG)
         head.pack(fill="x", padx=10, pady=(10, 4))
         self.lbl_server = tk.Label(head, text="服务器: 搜索中…", bg=self.BG,
@@ -368,11 +361,9 @@ class ControlPanel:
         nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.nb = nb
 
-        # ★ 标签栏右上角按钮组：歌词显示切换 + 关机（并排放在同一个 Frame 内）
         btn_group = tk.Frame(nb, bg=self.BG)
         btn_group.place(relx=1.0, x=-8, y=10, anchor="ne")
 
-        # 顺序：⚙ 设置 → ● 桌面歌词 → ⏻ 关闭达菲
         self.btn_settings = self._make_round_btn(
             btn_group, "⚙ 设置", self._toggle_lyrics_panel,
             width=64, height=22, radius=8)
@@ -395,12 +386,10 @@ class ControlPanel:
         card = tk.Frame(f1, bg=self.CARD)
         card.pack(fill="x", pady=(0, 8))
 
-        # 右侧封面区（固定 72×72）
         self.cover_canvas = tk.Canvas(card, width=72, height=72,
                                       bg=self.CARD, highlightthickness=0, bd=0)
         self.cover_canvas.pack(side="right", padx=(0, 12), pady=10)
 
-        # 左侧文字区
         info = tk.Frame(card, bg=self.CARD)
         info.pack(side="left", fill="both", expand=True, padx=12, pady=10)
         self.lbl_title = tk.Label(info, text="—", bg=self.CARD, fg=self.FG,
@@ -412,29 +401,22 @@ class ControlPanel:
                                    justify="left", wraplength=320)
         self.lbl_artist.pack(fill="x", anchor="w", pady=(2, 0))
 
-        # 初始显示默认唱片图标
         self._draw_default_cover()
 
         self.lbl_time = tk.Label(f1, text="00:00 / 00:00", bg=self.BG,
                                  fg=self.DIM, font=("Consolas", 10))
         self.lbl_time.pack(anchor="w")
 
-        # ---- 进度条（可拖动，自定义圆角滑块） ----
         self.progress = CanvasSlider(
             f1, from_=0, to=100, value=0,
-            bg=self.BG,
-            trough="#0F0F16",
-            fill=self.ACCENT,
-            thumb=self.FG,
-            thumb_hover="#FFFFFF",
+            bg=self.BG, trough="#0F0F16", fill=self.ACCENT,
+            thumb=self.FG, thumb_hover="#FFFFFF",
             height=22, track_height=6, thumb_radius=8,
-            on_drag_start=self._seek_start,
-            on_drag_end=self._seek_end)
+            on_drag_start=self._seek_start, on_drag_end=self._seek_end)
         self.progress.pack(fill="x", pady=(4, 0))
 
-        # 播放控制按钮组：居中 + 圆形按钮
         ctl = tk.Frame(f1, bg=self.BG)
-        ctl.pack(pady=(10, 6))          # 不加 fill="x"，pack 默认居中
+        ctl.pack(pady=(10, 6))
 
         self.btn_prev = self._make_play_btn(
             ctl, "◀◀", lambda: self._cmd("prev"),
@@ -457,22 +439,20 @@ class ControlPanel:
                  font=("Microsoft YaHei UI", 9)).pack(side="left")
         self.scl_vol = CanvasSlider(
             vol_row, from_=0, to=100, value=50,
-            bg=self.BG,
-            trough="#0F0F16",
-            fill=self.ACCENT,
-            thumb=self.FG,
-            thumb_hover="#FFFFFF",
+            bg=self.BG, trough="#0F0F16", fill=self.ACCENT,
+            thumb=self.FG, thumb_hover="#FFFFFF",
             height=22, track_height=6, thumb_radius=8,
             command=self._on_volume,
             on_drag_start=self._on_vol_drag_start,
             on_drag_end=self._on_vol_drag_end)
         self.scl_vol.pack(side="left", fill="x", expand=True, padx=8)
 
+        # ---- 歌词外观（默认隐藏） ----
+        self.ap_container = tk.Frame(f1, bg=self.BG)
 
-        # ---- 歌词外观（默认隐藏，点设置按钮后显示） ----
-        self.ap = tk.LabelFrame(f1, text=" 歌词外观 ",
+        self.ap = tk.LabelFrame(self.ap_container, text=" 歌词外观 ",
                                 bg=self.CARD, fg=self.FG)
-        # 默认不 pack，等用户点 ⚙ 设置 后再 pack
+        self.ap.pack(fill="x")
         self._lyrics_appearance_visible = False
 
         r0 = tk.Frame(self.ap, bg=self.CARD)
@@ -492,30 +472,34 @@ class ControlPanel:
 
         r1 = tk.Frame(self.ap, bg=self.CARD)
         r1.pack(fill="x", padx=10, pady=(6, 10))
-        # 三列等宽，色块组均匀分布
         for col in range(3):
             r1.columnconfigure(col, weight=1)
 
         frame_a, self._swatch_active = self._make_color_swatch(
             r1, "COLOR_ACTIVE", "已唱色")
         frame_a.grid(row=0, column=0, sticky="w")
-
         frame_b, self._swatch_idle = self._make_color_swatch(
             r1, "COLOR_IDLE", "未唱色")
         frame_b.grid(row=0, column=1, sticky="w")
-
         frame_c, self._swatch_stroke = self._make_color_swatch(
             r1, "COLOR_STROKE", "描边色")
         frame_c.grid(row=0, column=2, sticky="w")
 
-        # ================= TAB 2：音乐库 =================
+        # 关于按钮：在 LabelFrame 外部右下角
+        about_row = tk.Frame(self.ap_container, bg=self.BG)
+        about_row.pack(fill="x", pady=(4, 0))
+        self.btn_about = self._make_round_btn(
+            about_row, "ⓘ 关于", self._show_about,
+            width=64, height=22, radius=8,
+            bg=self.BG, btn_bg=self.CARD)
+        self.btn_about.pack(side="right")
+
+        # ================= TAB 2：音乐库（三列，无滚动条） =================
         f2 = ttk.Frame(nb, padding=10)
         nb.add(f2, text="音乐库")
 
         top = tk.Frame(f2, bg=self.BG)
         top.pack(fill="x", pady=(0, 6))
-        self.btn_back = self._mk_btn(top, "←", self._lib_back)
-        self.btn_back.pack(side="left", padx=(0, 6))
         self.ent_search = tk.Entry(top, bg=self.FIELD, fg=self.FG,
                                    insertbackground=self.FG, relief="flat",
                                    highlightthickness=1,
@@ -525,18 +509,54 @@ class ControlPanel:
         self.ent_search.bind("<Return>", lambda _e: self._lib_search())
         self.btn_search = self._mk_btn(top, "⌕", self._lib_search)
         self.btn_search.pack(side="left", padx=(4, 0))
+        self.btn_refresh = self._mk_btn(top, "↻", self._lib_refresh)
+        self.btn_refresh.pack(side="left", padx=(4, 0))
 
-        mid = tk.Frame(f2, bg=self.BG)
-        mid.pack(fill="both", expand=True)
-        sb = ttk.Scrollbar(mid, orient="vertical",
-                           style="Custom.Vertical.TScrollbar")
-        self.tree = ttk.Treeview(mid, show="tree", selectmode="extended",
-                                 height=6,          # ★ 默认 6 行，避免撑高整个面板
-                                 yscrollcommand=sb.set)
-        sb.config(command=self.tree.yview)
-        sb.pack(side="right", fill="y")
-        self.tree.pack(side="left", fill="both", expand=True)
-        self.tree.bind("<Double-1>", self._lib_activate)
+        cols = tk.Frame(f2, bg=self.BG)
+        cols.pack(fill="both", expand=True)
+        for i in range(3):
+            cols.columnconfigure(i, weight=0)   # 权重稍后按当前层级动态设置
+        cols.rowconfigure(0, weight=1)
+        self.cols_frame = cols
+
+        # 第 1 列：歌手
+        c1 = tk.Frame(cols, bg=self.BG)
+        c1.grid(row=0, column=0, sticky="nsew")
+        self.col_c1 = c1
+        self.lbl_hdr_artists = tk.Label(c1, text="歌手", bg=self.BG, fg=self.DIM,
+                                        font=("Microsoft YaHei UI", 9),
+                                        anchor="w", padx=4)
+        self.lbl_hdr_artists.pack(fill="x")
+        self.tree_artists = self._build_tree_column(c1)
+
+        # 第 2 列：专辑（初始隐藏）
+        c2 = tk.Frame(cols, bg=self.BG)
+        c2.grid(row=0, column=1, sticky="nsew")
+        self.col_c2 = c2
+        self.lbl_hdr_albums = tk.Label(c2, text="", bg=self.BG, fg=self.DIM,
+                                       font=("Microsoft YaHei UI", 9),
+                                       anchor="w", padx=4)
+        self.lbl_hdr_albums.pack(fill="x")
+        self.tree_albums = self._build_tree_column(c2)
+
+        # 第 3 列：歌曲（初始隐藏）
+        c3 = tk.Frame(cols, bg=self.BG)
+        c3.grid(row=0, column=2, sticky="nsew")
+        self.col_c3 = c3
+        self.lbl_hdr_tracks = tk.Label(c3, text="", bg=self.BG, fg=self.DIM,
+                                       font=("Microsoft YaHei UI", 9),
+                                       anchor="w", padx=4)
+        self.lbl_hdr_tracks.pack(fill="x")
+        self.tree_tracks = self._build_tree_column(c3)
+
+        # 初始只显示歌手列，占满整行
+        c2.grid_remove()
+        c3.grid_remove()
+        cols.columnconfigure(0, weight=1)
+
+        self.tree_artists.bind("<<TreeviewSelect>>", self._on_artist_selected)
+        self.tree_albums.bind("<<TreeviewSelect>>", self._on_album_selected)
+        self.tree_tracks.bind("<Double-1>", self._on_track_activate)
 
         bot = tk.Frame(f2, bg=self.BG)
         bot.pack(fill="x", pady=(6, 0))
@@ -544,15 +564,23 @@ class ControlPanel:
                                 font=("Microsoft YaHei UI", 9))
         self.lbl_lib.pack(side="left", padx=0)
 
-        # ★ tab 切换时同步设置按钮显隐与窗口高度
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        self._lib_show_artists()
+    def _build_tree_column(self, parent):
+        """创建一列无边框的 Treeview，无滚动条。
+           height=4 给一个较小初始值，靠 pack(fill/expand) 撑满可用空间，
+           避免把 Toplevel 的 reqheight 拉大。
+           鼠标滚轮自动滚动（ttk.Treeview 自带）。"""
+        tv = ttk.Treeview(parent, show="tree", selectmode="browse",
+                          style="Library.Treeview", height=4)
+        tv.pack(fill="both", expand=True)
+        return tv
 
     def _mk_btn(self, parent, text, cmd, width=None):
         kw = dict(text=text, command=cmd, bg=self.CARD, fg=self.FG,
                   activebackground=self.SEL_BG, activeforeground=self.FG,
-                  relief="flat", font=("Microsoft YaHei UI", 10), padx=8, pady=3)
+                  relief="flat", font=("Microsoft YaHei UI", 10),
+                  padx=8, pady=3)
         if width:
             kw["width"] = width
         return tk.Button(parent, **kw)
@@ -574,7 +602,6 @@ class ControlPanel:
             traceback.print_exc()
 
     def _toggle_lyrics(self):
-        """切换桌面歌词浮窗的显示 / 隐藏，并持久化到配置"""
         try:
             if self.overlay.is_visible():
                 self.overlay.hide()
@@ -587,56 +614,46 @@ class ControlPanel:
             self.cfg.save()
         except Exception:
             traceback.print_exc()
-    
+
     def _calc_panel_height(self):
-        """返回合适的窗口高度：
-           · 展开歌词外观 → 固定 472（内容自适应偏麻烦，直接给够）
-           · 收起歌词外观 → 固定 365，所有控件完整可见"""
+        """固定高度：
+           · 展开歌词外观 → 490（内容刚好占满，下方无空白）
+           · 收起 → 365"""
         if self._lyrics_appearance_visible:
-            return 472
+            return 490
         return 365
 
     def _on_tab_changed(self, _e=None):
-        """tab 切换时：
-           · 播放页（index 0） → 显示 ⚙ 设置 按钮
-           · 音乐库（index 1） → 隐藏 ⚙ 设置 按钮
-           · 窗口高度只由歌词外观展开状态决定，与 tab 无关：
-             展开 472 / 收起 365，切 tab 高度不变"""
         try:
             cur = self.nb.index(self.nb.select())
         except Exception:
             return
 
         if cur == 0:
-            # 播放页：恢复设置按钮，插到桌面歌词按钮左侧
             self.btn_settings.pack_forget()
             self.btn_settings.pack(side="left", padx=(0, 6),
                                    before=self.btn_lyrics)
         else:
-            # 音乐库：隐藏设置按钮
             self.btn_settings.pack_forget()
+            if not self.tree_artists.get_children():
+                self._lib_show_artists()
 
-        h = 472 if self._lyrics_appearance_visible else 365
-
+        h = self._calc_panel_height()
         self.panel.update_idletasks()
         try:
             self.panel.geometry(f"500x{h}")
         except tk.TclError:
             pass
-    
+
     def _toggle_lyrics_panel(self):
-        """切换歌词外观设置面板的显示 / 隐藏，并按状态调整窗口高度。
-           ★ 按钮文字始终保持「⚙ 设置」，不随展开/收起变化。"""
         if self._lyrics_appearance_visible:
-            self.ap.pack_forget()
+            self.ap_container.pack_forget()
             self._lyrics_appearance_visible = False
         else:
-            self.ap.pack(fill="x")
+            self.ap_container.pack(fill="x")
             self._lyrics_appearance_visible = True
 
-        # 高度始终由"歌词外观展开状态"决定
         h = self._calc_panel_height()
-
         self.panel.update_idletasks()
         try:
             self.panel.geometry(f"500x{h}")
@@ -648,19 +665,16 @@ class ControlPanel:
             self.lms.command(["mixer", "volume", str(int(float(val)))])
         except Exception:
             pass
-    
+
     def _on_vol_drag_start(self):
-        """用户开始拖动音量条：暂停远端同步，避免和拖动打架"""
         self._vol_dragging = True
 
     def _on_vol_drag_end(self):
-        """用户松手：延迟 300ms 再恢复同步，给 LMS 处理新值的时间"""
         self.panel.after(300, self._end_vol_drag)
 
     def _end_vol_drag(self):
         self._vol_dragging = False
 
-    # ---- 进度条拖动 ----
     def _seek_start(self):
         self._seeking = True
 
@@ -676,7 +690,7 @@ class ControlPanel:
         except Exception:
             traceback.print_exc()
 
-    # ================= 外观设置（即时保存） =================
+    # ================= 外观设置 =================
     def _font_families(self):
         fams = sorted({f for f in tkfont.families()
                        if f and not f.startswith(("@", "＠"))})
@@ -714,7 +728,6 @@ class ControlPanel:
         if hexcolor:
             setattr(self.cfg, key, hexcolor)
             self.cfg.save()
-            # 刷新对应色块
             swatch_map = {
                 "COLOR_ACTIVE": self._swatch_active,
                 "COLOR_IDLE":   self._swatch_idle,
@@ -726,6 +739,210 @@ class ControlPanel:
             self.overlay.set_line(self._line_text(), self._next_text(),
                                   self.track_info.get("title", ""))
 
+    # ================= 关于 / 更新 =================
+    def _open_url(self, url):
+        try:
+            webbrowser.open(url)
+        except Exception:
+            traceback.print_exc()
+
+    def _show_about(self):
+        win = tk.Toplevel(self.panel)
+        win.title("关于")
+        win.geometry("540x320")
+        win.configure(bg=self.BG)
+        win.resizable(False, False)
+        win.transient(self.panel)
+        win.grab_set()
+
+        try:
+            win.iconbitmap(_resource_path("icon.ico"))
+        except Exception:
+            pass
+
+        win.update_idletasks()
+        px = self.panel.winfo_rootx() + (self.panel.winfo_width() - 540) // 2
+        py = self.panel.winfo_rooty() + (self.panel.winfo_height() - 320) // 2
+        win.geometry(f"+{px}+{py}")
+
+        tk.Label(win, text="达菲播放器", bg=self.BG, fg=self.FG,
+                 font=("Microsoft YaHei UI", 15, "bold")).pack(pady=(16, 4))
+
+        tk.Label(win, text=f"版本 {APP_VERSION}", bg=self.BG, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 10)).pack()
+
+        tk.Frame(win, bg=self.SEL_BG, height=1).pack(fill="x",
+                                                     padx=24, pady=10)
+
+        row = tk.Frame(win, bg=self.BG)
+        row.pack(fill="x", padx=24, pady=2)
+        tk.Label(row, text="GitHub:", bg=self.BG, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        link = tk.Label(row, text=GITHUB_URL, bg=self.BG, fg=self.ACCENT,
+                        font=("Microsoft YaHei UI", 8, "underline"),
+                        cursor="hand2", wraplength=430, justify="left")
+        link.pack(side="left", padx=(4, 0), fill="x", expand=True)
+        link.bind("<Button-1>", lambda _e: self._open_url(GITHUB_URL))
+
+        # ★ 软件介绍：一段连续文字，去掉多余空格，只在中文标点处自然折行
+        intro_text = (
+            "本软件在Github免费开源，旨在为广大音乐发烧友提供一款简洁的"
+            "达菲桌面播放器。为更好运行本软件，你需要提前在达菲系统安装"
+            "Material Skin和Music and Artist Information插件。"
+        )
+        intro = tk.Label(
+            win,
+            text=intro_text,
+            bg=self.BG, fg=self.DIM,
+            font=("Microsoft YaHei UI", 9),
+            wraplength=490, justify="left")
+        intro.pack(fill="x", padx=24, pady=(10, 4))
+
+        btns = tk.Frame(win, bg=self.BG)
+        btns.pack(side="bottom", fill="x", padx=24, pady=(8, 12))
+
+        # 检查更新按钮
+        self._about_check_btn = self._make_round_btn(
+            btns, "检查更新", lambda: self._check_update(auto=False),
+            width=96, height=28, radius=10,
+            bg=self.BG, btn_bg=self.CARD)
+        self._about_check_btn.pack(side="left")
+
+        # 自动检查更新
+        tk.Label(btns, text="自动检查更新", bg=self.BG, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left",
+                                                      padx=(16, 6))
+
+        self._about_auto_toggle = self._make_toggle_switch(
+            btns, self._toggle_auto_check,
+            initial=bool(getattr(self.cfg, "AUTO_CHECK_UPDATE", True)))
+        self._about_auto_toggle.pack(side="left")
+
+        self._about_status_lbl = tk.Label(
+            win, text="", bg=self.BG, fg=self.DIM,
+            font=("Microsoft YaHei UI", 9))
+        self._about_status_lbl.pack(side="bottom", pady=(0, 4))
+
+    def _toggle_auto_check(self):
+        """切换自动检查开关并持久化。
+           ★ 从"关"切到"开"时，立即触发一次手动检查更新。"""
+        cur = bool(getattr(self.cfg, "AUTO_CHECK_UPDATE", True))
+        self.cfg.AUTO_CHECK_UPDATE = not cur
+        try:
+            self.cfg.save()
+        except Exception:
+            pass
+        try:
+            if self._about_auto_toggle is not None:
+                self._about_auto_toggle.set_value(
+                    self.cfg.AUTO_CHECK_UPDATE)
+        except tk.TclError:
+            pass
+
+        # 从关 → 开：立即执行一次检查更新（auto=False 表示显示状态文字）
+        if self.cfg.AUTO_CHECK_UPDATE:
+            self._check_update(auto=False)
+
+    def _check_update(self, auto=False):
+        if self._update_checking:
+            return
+        self._update_checking = True
+
+        if not auto:
+            try:
+                if self._about_status_lbl is not None:
+                    self._about_status_lbl.config(
+                        text="正在检查更新…", fg=self.DIM)
+            except tk.TclError:
+                pass
+
+        def work():
+            latest = ""
+            err = ""
+            try:
+                req = urllib.request.Request(
+                    RELEASES_API,
+                    headers={"User-Agent": "lms-karaoke",
+                             "Accept": "application/vnd.github+json"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                    latest = (data.get("tag_name") or "").strip()
+            except Exception as e:
+                err = str(e)
+
+            def apply():
+                self._update_checking = False
+                if err or not latest:
+                    if not auto:
+                        try:
+                            if self._about_status_lbl is not None:
+                                self._about_status_lbl.config(
+                                    text=f"检查失败: {err[:40]}",
+                                    fg="#FF8080")
+                        except tk.TclError:
+                            pass
+                    return
+
+                has_new = self._version_greater(latest, APP_VERSION)
+                if has_new:
+                    try:
+                        if messagebox.askyesno(
+                                "发现新版本",
+                                f"当前版本 {APP_VERSION}\n"
+                                f"发现新版 {latest}\n\n"
+                                f"是否前往下载？",
+                                parent=self.panel):
+                            self._open_url(DOWNLOAD_URL)
+                    except tk.TclError:
+                        pass
+                    if not auto:
+                        try:
+                            if self._about_status_lbl is not None:
+                                self._about_status_lbl.config(
+                                    text=f"最新版本: {latest}",
+                                    fg=self.ACCENT)
+                        except tk.TclError:
+                            pass
+                else:
+                    if not auto:
+                        try:
+                            if self._about_status_lbl is not None:
+                                self._about_status_lbl.config(
+                                    text=f"已是最新版本 ({APP_VERSION})",
+                                    fg="#4AE0C0")
+                        except tk.TclError:
+                            pass
+
+            try:
+                self.panel.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _version_greater(a, b):
+        def parse(s):
+            s = (s or "").strip().lstrip("vV")
+            nums = []
+            for part in s.split("."):
+                m = ""
+                for ch in part:
+                    if ch.isdigit():
+                        m += ch
+                    else:
+                        break
+                nums.append(int(m) if m else 0)
+            return nums
+
+        na = parse(a)
+        nb = parse(b)
+        while len(na) < len(nb):
+            na.append(0)
+        while len(nb) < len(na):
+            nb.append(0)
+        return na > nb
+
     # ================= 状态轮询 =================
     def _poll_loop(self):
         last_track = None
@@ -735,7 +952,6 @@ class ControlPanel:
                 self.song_pos = st.get("time", 0.0)
                 self._duration = st.get("duration", 0.0)
                 self._playing = st.get("mode") == "play"
-                # ★ 每轮都同步远端音量（用户正在拖动时跳过）
                 if "volume" in st and not self._vol_dragging:
                     try:
                         v = float(st["volume"])
@@ -748,7 +964,6 @@ class ControlPanel:
                     last_track = tid
                     self.track_info = st
                     self._start_fetch(st)
-                # ★ 每次轮询都检查封面（cover_id 相同会内部跳过）
                 self._update_cover(st)
             except Exception:
                 time.sleep(1.0)
@@ -790,7 +1005,6 @@ class ControlPanel:
 
     # ================= 专辑封面 =================
     def _draw_default_cover(self):
-        """无封面时：画一个唱片图标"""
         c = self.cover_canvas
         c.delete("all")
         cx = cy = 36
@@ -805,14 +1019,12 @@ class ControlPanel:
         self._cover_photo = None
 
     def _set_cover_image(self, photo):
-        """主线程中显示封面图"""
         c = self.cover_canvas
         c.delete("all")
         self._cover_photo = photo
         c.create_image(36, 36, image=photo)
 
     def _update_cover(self, st):
-        """根据 status 里的封面标识决定显示封面 / 默认图标（在 poll 线程调用）"""
         cover_id = str(st.get("coverid", "") or "").strip()
         track_id = str(st.get("track_id", "") or "").strip()
 
@@ -843,7 +1055,6 @@ class ControlPanel:
             self._fetch_cover(key, cover_id, track_id)
 
     def _fetch_cover(self, key, cover_id, track_id):
-        """后台下载封面字节，回主线程转 PhotoImage"""
         host, port = self.lms.host, self.lms.port
         mac = ""
         try:
@@ -887,9 +1098,6 @@ class ControlPanel:
                         self.panel.after(
                             0, lambda d=data, k=key: self._on_cover_downloaded(k, d))
                         return
-                    else:
-                        print(f"[封面] 非图片响应: {url} "
-                              f"(head={data[:16]!r})")
                 except Exception as e:
                     print(f"[封面] 请求失败 {url}: {e}")
             print(f"[封面] 全部 URL 失败 key={key}")
@@ -909,7 +1117,6 @@ class ControlPanel:
             photo = ImageTk.PhotoImage(img)
             self._cover_cache[key] = photo
             self._set_cover_image(photo)
-            print(f"[封面] 已显示 key={key}")
         except Exception as e:
             print(f"[封面] 解析失败: {e}")
 
@@ -944,7 +1151,6 @@ class ControlPanel:
             except Exception:
                 pass
 
-        # 卡拉OK刷写
         if self.lines:
             idx = LrcParser.find_current(self.lines, self.song_pos)
             if idx != self.cur_line_idx:
@@ -953,8 +1159,13 @@ class ControlPanel:
                                       info.get("title", ""))
             if 0 <= idx < len(self.lines):
                 t0 = self.lines[idx][0]
-                t1 = (self.lines[idx + 1][0] if idx + 1 < len(self.lines)
-                      else t0 + max(3.0, len(self.lines[idx][1]) * 0.28))
+                j = idx + 1
+                while j < len(self.lines) and self.lines[j][0] == t0:
+                    j += 1
+                if j < len(self.lines):
+                    t1 = self.lines[j][0]
+                else:
+                    t1 = t0 + max(3.0, len(self.lines[idx][1]) * 0.28)
                 span = max(t1 - t0, 0.3)
                 self.overlay.set_progress((self.song_pos - t0) / span)
         elif self._lyrics_source == "未找到":
@@ -963,13 +1174,10 @@ class ControlPanel:
         else:
             t = info.get("title", "")
             self.overlay.clear(t, message=f"{t}" if t else "")
-        # 同步歌词按钮文字（浮窗也可能被右键菜单直接隐藏/显示）
+
         try:
             vis = self.overlay.is_visible()
             self.btn_lyrics.set_text("● 桌面歌词" if vis else "○ 桌面歌词")
-            # ★ 只在"状态发生变化"时写配置：
-            #   第一次 tick 只记录初始状态，不写盘，
-            #   避免启动时 overlay 还没按配置 show 就被误判为"用户隐藏"。
             if self._last_overlay_vis is None:
                 self._last_overlay_vis = vis
             elif self._last_overlay_vis != vis:
@@ -998,18 +1206,23 @@ class ControlPanel:
             return self.lines[i][1]
         return ""
 
-    # ================= 音乐库 =================
+    # ================= 音乐库（三列） =================
     def _lib_set_status(self, text):
         self.lbl_lib.config(text=text)
 
-    def _lib_clear(self):
-        self.tree.delete(*self.tree.get_children())
-        self._lib_items.clear()
+    def _lib_clear_artists(self):
+        self.tree_artists.delete(*self.tree_artists.get_children())
+        self._lib_artists.clear()
 
-    # ---- 图标生成 ----
+    def _lib_clear_albums(self):
+        self.tree_albums.delete(*self.tree_albums.get_children())
+        self._lib_albums.clear()
+
+    def _lib_clear_tracks(self):
+        self.tree_tracks.delete(*self.tree_tracks.get_children())
+        self._lib_tracks.clear()
+
     def _make_icon(self, kind):
-        """生成 18×18 图标：'artist'=话筒，'album'=唱片。
-           结果缓存，多次调用只画一次。无 PIL 时返回 None。"""
         if kind in self._icon_cache:
             return self._icon_cache[kind]
         if not HAS_PIL:
@@ -1023,13 +1236,11 @@ class ControlPanel:
         dark = "#3D3D5C"
 
         if kind == "artist":
-            # 话筒：网罩 + 把手
-            d.ellipse((6, 1, 12, 10), fill=accent)          # 网罩
-            d.ellipse((7, 2, 9, 6), fill="#FFFFFF")          # 高光
-            d.rectangle((8, 10, 10, 15), fill=dark)          # 把手
-            d.rectangle((6, 15, 12, 16), fill=dark)          # 底座
+            d.ellipse((6, 1, 12, 10), fill=accent)
+            d.ellipse((7, 2, 9, 6), fill="#FFFFFF")
+            d.rectangle((8, 10, 10, 15), fill=dark)
+            d.rectangle((6, 15, 12, 16), fill=dark)
         elif kind == "album":
-            # 唱片：黑胶盘 + 标签 + 中心孔
             d.ellipse((0, 0, 17, 17), fill=dark)
             d.ellipse((4, 4, 13, 13), fill=accent)
             d.ellipse((7, 7, 10, 10), fill="#15151E")
@@ -1043,81 +1254,199 @@ class ControlPanel:
         self._icon_cache[kind] = photo
         return photo
 
-    def _lib_add_row(self, iid, text, kind, item_id, extra=None):
-        """kind='artist'/'album' 时自动带图标；'track' 不带图标"""
-        icon = None
-        if kind in ("artist", "album"):
-            icon = self._make_icon(kind)
-        if icon is not None:
-            self.tree.insert("", "end", iid=iid, text=text, image=icon)
-        else:
-            self.tree.insert("", "end", iid=iid, text=text)
-        self._lib_items[iid] = (kind, str(item_id), text, extra)
+    def _set_headers(self, level):
+        """按层级切换表头 + 列显示/隐藏。
 
-    def _lib_run(self, status_text, work, fill):
-        self._lib_set_status(status_text)
+           · artists：只显示歌手列，占满 100% 宽度
+           · albums ：歌手 + 专辑，各占 50%
+           · tracks ：歌手 + 专辑 + 歌曲，各占 1/3
 
-        def thread_body():
+           专辑 / 歌曲的表头与它们所在的列共用可见性，位置随 grid 自动
+           左右对齐。"""
+        # 表头文字
+        if level == "artists":
+            self.lbl_hdr_albums.config(text="")
+            self.lbl_hdr_tracks.config(text="")
+        elif level == "albums":
+            self.lbl_hdr_albums.config(text="专辑")
+            self.lbl_hdr_tracks.config(text="")
+        elif level == "tracks":
+            self.lbl_hdr_albums.config(text="专辑")
+            self.lbl_hdr_tracks.config(text="歌曲")
+
+        # 列布局
+        if level == "artists":
+            self.col_c2.grid_remove()
+            self.col_c3.grid_remove()
+            self.cols_frame.columnconfigure(0, weight=1)
+            self.cols_frame.columnconfigure(1, weight=0)
+            self.cols_frame.columnconfigure(2, weight=0)
+        elif level == "albums":
+            self.col_c2.grid()
+            self.col_c3.grid_remove()
+            self.cols_frame.columnconfigure(0, weight=1)
+            self.cols_frame.columnconfigure(1, weight=1)
+            self.cols_frame.columnconfigure(2, weight=0)
+        else:  # tracks
+            self.col_c2.grid()
+            self.col_c3.grid()
+            self.cols_frame.columnconfigure(0, weight=1)
+            self.cols_frame.columnconfigure(1, weight=1)
+            self.cols_frame.columnconfigure(2, weight=1)
+
+    def _lib_show_artists(self):
+        self._lib_clear_artists()
+        self._lib_clear_albums()
+        self._lib_clear_tracks()
+        self._set_headers("artists")
+        self._lib_set_status("加载艺人中…")
+        token = self._lib_artist_token = self._lib_artist_token + 1
+
+        def work():
             try:
-                data = work()
+                data = self.lms.browse_artists()
             except Exception as e:
                 print(f"[音乐库] {e}")
                 data = []
-            self.panel.after(0, lambda: fill(data))
+            self.panel.after(0, lambda: self._lib_fill_artists(data, token))
 
-        threading.Thread(target=thread_body, daemon=True).start()
+        threading.Thread(target=work, daemon=True).start()
 
-    def _lib_show_artists(self):
-        self._lib_stack = []
-        self._lib_run("加载艺人中…",
-                      self.lms.browse_artists,
-                      self._lib_fill_artists)
-
-    def _lib_fill_artists(self, artists):
-        self._lib_clear()
+    def _lib_fill_artists(self, artists, token):
+        if token != self._lib_artist_token:
+            return
+        self._lib_clear_artists()
         for a in artists:
-            self._lib_add_row(f"ar{a[0]}", f"{a[1]}", "artist", a[0])
-        self._lib_set_status(f"共 {len(artists)} 位艺人 · 双击浏览专辑")
+            aid, aname = a
+            iid = f"ar{aid}"
+            self.tree_artists.insert("", "end", iid=iid, text=aname,
+                                     image=self._make_icon("artist"))
+            self._lib_artists[iid] = (str(aid), aname)
+        self._lib_set_status(f"共 {len(artists)} 位艺人 · 单击查看专辑")
 
-    def _lib_browse_albums(self, artist_id, artist_name):
-        self._lib_run(f"加载 {artist_name} 的专辑…",
-                      lambda: self.lms.browse_albums(artist_id),
-                      lambda data: self._lib_fill_albums(data, artist_name))
+    def _lib_load_albums(self, artist_id, artist_name):
+        self._lib_clear_albums()
+        self._lib_clear_tracks()
+        self._set_headers("albums")
+        self._lib_set_status(f"加载 {artist_name} 的专辑…")
+        token = self._lib_album_token = self._lib_album_token + 1
 
-    def _lib_fill_albums(self, albums, artist_name):
-        self._lib_clear()
+        def work():
+            try:
+                data = self.lms.browse_albums(artist_id)
+            except Exception as e:
+                print(f"[音乐库] {e}")
+                data = []
+            self.panel.after(0, lambda: self._lib_fill_albums(
+                data, artist_name, token))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _lib_fill_albums(self, albums, artist_name, token):
+        if token != self._lib_album_token:
+            return
+        self._lib_clear_albums()
         for al in albums:
-            self._lib_add_row(f"al{al[0]}", f"{al[1]}", "album", al[0])
-        self._lib_set_status(f"{artist_name} · {len(albums)} 张专辑 · 双击浏览歌曲")
+            alid, alname = al
+            iid = f"al{alid}"
+            self.tree_albums.insert("", "end", iid=iid, text=alname,
+                                    image=self._make_icon("album"))
+            self._lib_albums[iid] = (str(alid), alname)
+        self._lib_set_status(
+            f"{artist_name} · {len(albums)} 张专辑 · 单击查看歌曲")
 
-    def _lib_browse_tracks(self, album_id, album_name):
-        self._lib_run(f"加载 {album_name} 的歌曲…",
-                      lambda: self.lms.browse_tracks(album_id),
-                      lambda data: self._lib_fill_tracks(data, album_name))
+    def _lib_load_tracks(self, album_id, album_name):
+        self._lib_clear_tracks()
+        self._set_headers("tracks")
+        self._lib_set_status(f"加载 {album_name} 的歌曲…")
+        token = self._lib_track_token = self._lib_track_token + 1
 
-    def _lib_fill_tracks(self, tracks, album_name):
-        self._lib_clear()
+        def work():
+            try:
+                data = self.lms.browse_tracks(album_id)
+            except Exception as e:
+                print(f"[音乐库] {e}")
+                data = []
+            self.panel.after(0, lambda: self._lib_fill_tracks(
+                data, album_name, token))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _lib_fill_tracks(self, tracks, album_name, token):
+        if token != self._lib_track_token:
+            return
+        self._lib_clear_tracks()
         for t in tracks:
             tid, tno, tname = t
+            iid = f"tr{tid}"
             label = f"{tno}. {tname}" if tno else tname
-            self._lib_add_row(f"tr{tid}", label, "track", tid)
+            self.tree_tracks.insert("", "end", iid=iid, text=label)
+            self._lib_tracks[iid] = (str(tid), tname)
         self._lib_set_status(f"{album_name} · {len(tracks)} 首 · 双击播放")
+
+    def _on_artist_selected(self, _e=None):
+        sel = self.tree_artists.selection()
+        if not sel:
+            return
+        info = self._lib_artists.get(sel[0])
+        if not info:
+            return
+        aid, aname = info
+        # ★ 搜索结果里的补充歌手无 id，点击无操作
+        if not aid:
+            self._lib_set_status(f"「{aname}」来自搜索结果，无独立 ID，无法浏览专辑")
+            return
+        self._lib_load_albums(aid, aname)
+
+    def _on_album_selected(self, _e=None):
+        sel = self.tree_albums.selection()
+        if not sel:
+            return
+        info = self._lib_albums.get(sel[0])
+        if not info:
+            return
+        alid, alname = info
+        # ★ 理论上搜索结果的专辑都有 id（上一段代码已过滤空 id）
+        if not alid:
+            self._lib_set_status(f"「{alname}」缺少 ID，无法加载歌曲")
+            return
+        self._lib_load_tracks(alid, alname)
+
+    def _on_track_activate(self, _e=None):
+        sel = self.tree_tracks.selection()
+        if not sel:
+            return
+        info = self._lib_tracks.get(sel[0])
+        if not info:
+            return
+        tid, tname = info
+        self.lms.play_track(tid)
+        self._lib_set_status(f"正在播放: {tname}")
 
     def _lib_search(self):
         q = self.ent_search.get().strip()
         if not q:
             return
-        self._lib_run(f"搜索“{q}”…",
-                      lambda: self.lms.search(q),
-                      self._lib_fill_search)
+        self._lib_set_status(f"搜索“{q}”…")
+
+        def work():
+            try:
+                res = self.lms.search(q)
+            except Exception as e:
+                print(f"[音乐库] {e}")
+                res = {"artists": [], "albums": [], "tracks": []}
+            self.panel.after(0, lambda: self._lib_fill_search(res))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _lib_fill_search(self, res):
-        self._lib_clear()
+        # 兼容列表格式的兜底
         if isinstance(res, list):
             d = {"artists": [], "albums": [], "tracks": []}
             for item in res:
                 if isinstance(item, dict) and "title" in item:
-                    d["tracks"].append((item.get("id"), 0, item["title"]))
+                    d["tracks"].append((item.get("id"), 0,
+                                        item["title"], "", "", ""))
                 elif isinstance(item, dict):
                     d["artists"].append((item.get("id"),
                                          item.get("name", str(item))))
@@ -1126,53 +1455,131 @@ class ControlPanel:
             self._lib_set_status("搜索结果格式异常")
             return
 
-        n = 0
-        for t in res.get("tracks", []) or []:
-            self._lib_add_row(f"tr{t[0]}", f"{t[2]}", "track", t[0])
-            n += 1
-        for al in res.get("albums", []) or []:
-            self._lib_add_row(f"al{al[0]}", f"{al[1]}", "album", al[0])
-            n += 1
-        for a in res.get("artists", []) or []:
-            self._lib_add_row(f"ar{a[0]}", f"{a[1]}", "artist", a[0])
-            n += 1
+        artists_list = res.get("artists", []) or []
+        albums_list = res.get("albums", []) or []
+        tracks_list = res.get("tracks", []) or []
+
+        self._lib_clear_artists()
+        self._lib_clear_albums()
+        self._lib_clear_tracks()
+
+        # ---- 1. 歌曲列：每行都必须带歌手名；同时收集歌曲对应的专辑 ----
+        track_albums = []      # [(album_id_str, album_name), ...]
+        song_artist_names = []  # 歌曲里出现过的歌手名（用于补充歌手列）
+        seen_song_artist_names = set()
+
+        for t in tracks_list:
+            # 解析 6 元组（含旧格式兜底）
+            if isinstance(t, (tuple, list)) and len(t) >= 6:
+                tid, tno, tname = t[0], t[1], t[2]
+                artist, album = t[3] or "", t[4] or ""
+                album_id = str(t[5] or "")
+            elif isinstance(t, (tuple, list)) and len(t) >= 5:
+                tid, tno, tname = t[0], t[1], t[2]
+                artist, album = t[3] or "", t[4] or ""
+                album_id = ""
+            elif isinstance(t, (tuple, list)) and len(t) >= 3:
+                tid, tno, tname = t[0], t[1], t[2]
+                artist, album, album_id = "", "", ""
+            else:
+                continue
+
+            # 歌曲行只显示歌名（带曲号），歌手名统一在左侧"歌手"列展示
+            if tno:
+                label = f"{tno}. {tname}"
+            else:
+                label = tname
+
+            iid = f"tr{tid}"
+            self.tree_tracks.insert("", "end", iid=iid, text=label)
+            self._lib_tracks[iid] = (str(tid), tname)
+
+            # 收集专辑信息（必须有 album_id 才会出现在专辑列）
+            if album and album_id:
+                track_albums.append((album_id, album))
+
+            # 收集歌曲里的歌手名
+            if artist and artist not in seen_song_artist_names:
+                seen_song_artist_names.add(artist)
+                song_artist_names.append(artist)
+
+        # ---- 2. 歌手列：搜索结果歌手 + 歌曲里出现但未被搜索命中的歌手 ----
+        loaded_artist_names = set()
+        for a in artists_list:
+            if isinstance(a, (tuple, list)) and len(a) >= 2:
+                aid, aname = a[0], a[1]
+            else:
+                aid, aname = a, str(a)
+            if not aname:
+                continue
+            iid = f"ar{aid}"
+            self.tree_artists.insert("", "end", iid=iid, text=aname,
+                                     image=self._make_icon("artist"))
+            self._lib_artists[iid] = (str(aid), aname)
+            loaded_artist_names.add(aname)
+
+        # 补充：歌曲里出现但 artists 搜索未命中的歌手（无 id，不可点击）
+        for aname in song_artist_names:
+            if aname in loaded_artist_names:
+                continue
+            loaded_artist_names.add(aname)
+            iid = f"arnoart_{aname}"
+            self.tree_artists.insert("", "end", iid=iid, text=aname,
+                                     image=self._make_icon("artist"))
+            self._lib_artists[iid] = ("", aname)   # id 空
+
+        # ---- 3. 专辑列：搜索结果专辑 + 歌曲专辑（只保留有 id 的） ----
+        seen_album_keys = set()
+        ordered_albums = []      # [(album_id_str, album_name), ...]
+
+        # 先放搜索结果专辑
+        for al in albums_list:
+            if isinstance(al, (tuple, list)) and len(al) >= 2:
+                alid, alname = str(al[0] or ""), al[1]
+            else:
+                alid, alname = "", str(al)
+            if not alname or not alid:
+                continue       # ★ 无 id 的专辑不显示，避免点击混乱
+            key = (alid, alname)
+            if key in seen_album_keys:
+                continue
+            seen_album_keys.add(key)
+            ordered_albums.append((alid, alname))
+
+        # 再补充歌曲对应的专辑（同名去重）
+        existing_album_names = {n for _, n in ordered_albums}
+        for alid, alname in track_albums:
+            if alname in existing_album_names:
+                continue
+            key = (alid, alname)
+            if key in seen_album_keys:
+                continue
+            seen_album_keys.add(key)
+            ordered_albums.append((alid, alname))
+            existing_album_names.add(alname)
+
+        for alid, alname in ordered_albums:
+            iid = f"al{alid}"
+            self.tree_albums.insert("", "end", iid=iid, text=alname,
+                                    image=self._make_icon("album"))
+            self._lib_albums[iid] = (alid, alname)
+
+        # ---- 4. 列显示与表头 ----
+        if tracks_list:
+            self._set_headers("tracks")
+        else:
+            # 无歌曲结果 → 只显示歌手列；专辑/歌曲列及表头全部隐藏
+            self._set_headers("artists")
+            self._lib_clear_albums()
+
+        n = (len(loaded_artist_names)
+             + (len(ordered_albums) if tracks_list else 0)
+             + len(tracks_list))
         self._lib_set_status(f"搜索到 {n} 项")
 
-    def _lib_activate(self, _e=None):
-        sel = self.tree.selection()
-        if not sel:
-            return
-        kind, item_id, name, _extra = self._lib_items[sel[0]]
-        if kind == "artist":
-            self._lib_stack.append(("artist", item_id, name))
-            self._lib_browse_albums(item_id, name)
-        elif kind == "album":
-            self._lib_stack.append(("album", item_id, name))
-            self._lib_browse_tracks(item_id, name)
-        elif kind == "track":
-            self.lms.play_track(item_id)
-            self._lib_set_status(f"正在播放: {name}")
-
-    def _lib_back(self):
-        if not self._lib_stack:
-            # 已在顶层，刷新艺人列表
-            self._lib_show_artists()
-            return
-
-        # 弹出"当前正在浏览的对象"，回到它的上一级
-        self._lib_stack.pop()
-
-        if not self._lib_stack:
-            # 栈空 → 回顶层艺人列表
-            self._lib_show_artists()
-            return
-
-        # 看新的栈顶，决定回到哪个视图
-        kind, iid, name = self._lib_stack[-1]
-        if kind == "artist":
-            self._lib_browse_albums(iid, name)
-        else:
-            self._lib_browse_tracks(iid, name)
+    def _lib_refresh(self):
+        print("[音乐库] 刷新")
+        self._lib_show_artists()
 
     # ================= 关闭 =================
     def close(self):
@@ -1181,46 +1588,86 @@ class ControlPanel:
         self._cover_photo = None
         self._icon_cache.clear()
 
-    # 在 control_panel.py 的 ControlPanel 类中添加
-
+    def _wait_for_host_down(self, ip, ports=(80, 9000), timeout=30,
+                            interval=1.0):
+        """轮询检测主机是否已不可达（端口全部连接失败）。
+           返回 True 表示已关机/断网，False 表示超时仍在线。
+           在后台线程中调用，不阻塞 UI。
+           ★ 首轮立即检测（不 sleep），若第一次就不可达说明关机极快。"""
+        import socket
+        start = time.time()
+        attempt = 0
+        while time.time() - start < timeout:
+            attempt += 1
+            all_down = True
+            for port in ports:
+                try:
+                    with socket.create_connection((ip, port), timeout=1.0):
+                        all_down = False
+                        break
+                except OSError:
+                    pass
+            if all_down:
+                print(f"[关机] 主机 {ip} 已不可达"
+                      f"（第 {attempt} 次检测），确认关机完成")
+                return True
+            time.sleep(interval)
+        print(f"[关机] 超时 {timeout}s，主机 {ip} 仍在线")
+        return False
+    
+    # ================= 关机 =================
     def _shutdown_daphile(self):
-        """关机确认与执行"""
-        from tkinter import messagebox
-        
-        # 二次确认
         confirm = messagebox.askyesno(
             "确认关机",
             "确定要关闭达菲设备吗？\n\n"
-            "关机后设备将完全断电，需要手动重新开机。",
+            "关机后需要手动开机或远程唤醒。",
             parent=self.panel
         )
         if not confirm:
             return
-        
-        # 禁用按钮，防止重复点击
+
         self.btn_shutdown.set_state(False)
         self.btn_shutdown.set_text("正在关机…")
         self._lib_set_status("正在向达菲发送关机指令…")
+        host = self.lms.host
 
-        # 在后台线程执行，避免阻塞 UI
         def work():
+            # 1. 发送关机请求（超时/连接断开都会被判定为已发出）
             ok = self.lms.shutdown_daphile()
+            if not ok:
+                def fail():
+                    self._lib_set_status("关机指令发送失败，请检查网络")
+                    self.btn_shutdown.set_text("⏻ 关闭达菲")
+                    self.btn_shutdown.set_state(True)
+                self.panel.after(0, fail)
+                return
+
+            def sent():
+                self._lib_set_status("关机指令已发送，等待设备断开…")
+                self.btn_shutdown.set_text("等待关机…")
+            self.panel.after(0, sent)
+
+            # 2. 先等 2 秒让 CGI 触发关机动作（部分版本需要时间）
+            time.sleep(2)
+
+            # 3. 轮询主机不可达，最多 30 秒（DAC 关机可能较慢）
+            down = self._wait_for_host_down(host, timeout=30)
+
+            # 4. 回主线程决定下一步
             def apply():
-                if ok:
-                    self._lib_set_status("关机指令已发送，设备即将关闭")
-                    self.btn_shutdown.set_text("已发送指令")
-                    # 延迟 2 秒后触发重连流程，让状态文字先显示出来
-                    self.panel.after(2000, self._after_shutdown)
+                if down:
+                    self._lib_set_status("设备已关机，即将返回连接界面…")
+                    self.panel.after(500, self._after_shutdown)
                 else:
-                    self._lib_set_status("关机失败，请检查网络连接")
+                    self._lib_set_status(
+                        "等待超时，设备可能仍在运行，请手动确认")
                     self.btn_shutdown.set_text("⏻ 关闭达菲")
                     self.btn_shutdown.set_state(True)
             self.panel.after(0, apply)
 
         threading.Thread(target=work, daemon=True).start()
-    
+
     def _after_shutdown(self):
-        """关机成功后：通知 main.py 弹出重连对话框"""
         if callable(self.on_daphile_shutdown):
             try:
                 self.on_daphile_shutdown()
@@ -1228,14 +1675,11 @@ class ControlPanel:
                 traceback.print_exc()
 
     def reconnect(self, lms, fetcher, player_name, server_label):
-        """主流程重连成功后，更新内部引用并恢复界面。
-           poll_loop 每轮都读 self.lms，引用更新后下个周期就切到新连接。"""
         self.lms = lms
         self.fetcher = fetcher
         self.player_name = player_name or ""
         self.lbl_server.config(text=server_label)
 
-        # 重置封面 / 歌词状态，避免旧数据残留
         self._current_cover_id = ""
         self._cover_cache.clear()
         self._cover_photo = None
@@ -1244,21 +1688,18 @@ class ControlPanel:
         self._lyrics_source = ""
         self.track_info = {}
 
-        # 重置关机按钮
         try:
             self.btn_shutdown.set_text("⏻ 关闭达菲")
             self.btn_shutdown.set_state(True)
         except Exception:
             pass
 
-                # 显示主界面
         try:
             self.panel.deiconify()
             self.panel.lift()
         except tk.TclError:
             pass
 
-        # 浮窗按配置恢复显隐
         try:
             if getattr(self.cfg, "OVERLAY_VISIBLE", True):
                 self.overlay.show()
@@ -1271,19 +1712,23 @@ class ControlPanel:
 
     # ================= 美化控件工厂 =================
     def _make_round_btn(self, parent, text, cmd,
-                        width=112, height=22, radius=8):
-        """Canvas 圆角矩形按钮。返回 canvas，附带 set_text / set_state 方法"""
+                        width=112, height=22, radius=8,
+                        bg=None, btn_bg=None):
+        canvas_bg = bg if bg is not None else self.BG
+        button_bg = btn_bg if btn_bg is not None else self.CARD
         canvas = tk.Canvas(parent, width=width, height=height,
-                           bg=self.BG, highlightthickness=0, bd=0)
+                           bg=canvas_bg, highlightthickness=0, bd=0)
         state = {"text": text, "hover": False, "enabled": True}
 
         def redraw():
             canvas.delete("all")
-            bg_color = self.SEL_BG if state["hover"] else self.CARD
+            if state["hover"]:
+                bg_color = self.ACCENT if button_bg == self.SEL_BG else self.SEL_BG
+            else:
+                bg_color = button_bg
             fg_color = self.FG if state["enabled"] else self.DIM
             r = radius
             w, h = width, height
-            # 四角圆弧
             canvas.create_arc(0, 0, 2 * r, 2 * r, start=90, extent=90,
                               fill=bg_color, outline=bg_color)
             canvas.create_arc(w - 2 * r, 0, w, 2 * r, start=0, extent=90,
@@ -1293,12 +1738,10 @@ class ControlPanel:
             canvas.create_arc(w - 2 * r, h - 2 * r, w, h,
                               start=270, extent=90,
                               fill=bg_color, outline=bg_color)
-            # 中间矩形
             canvas.create_rectangle(r, 0, w - r, h,
                                     fill=bg_color, outline=bg_color)
             canvas.create_rectangle(0, r, w, h - r,
                                     fill=bg_color, outline=bg_color)
-            # 文字
             canvas.create_text(w // 2, h // 2, text=state["text"],
                                fill=fg_color,
                                font=("Microsoft YaHei UI", 9))
@@ -1334,9 +1777,138 @@ class ControlPanel:
         canvas.set_state = set_state
         return canvas
 
+    def _get_toggle_photo(self, width, height, is_on, is_hover):
+        """Pillow 超采样生成抗锯齿药丸开关图，按 (尺寸, 状态) 缓存。
+           失败（无 PIL）时返回 None，调用方回退 Canvas 绘制。"""
+        if not hasattr(self, "_toggle_cache"):
+            self._toggle_cache = {}
+        key = (width, height, is_on, is_hover)
+        if key in self._toggle_cache:
+            return self._toggle_cache[key]
+        if not HAS_PIL:
+            return None
+        try:
+            ss = 4
+            W = width * ss
+            H = height * ss
+            if is_on:
+                track = "#7A7AFF" if is_hover else self.ACCENT
+                knob = "#FFFFFF"
+            else:
+                track = "#4A4A6A" if is_hover else "#3D3D5C"
+                knob = "#E8E8F0"
+
+            # 背景填 CARD，让药丸边缘抗锯齿像素渐变到卡片色
+            img = Image.new("RGB", (W, H), self.CARD)
+            d = ImageDraw.Draw(img)
+
+            # 药丸轨道：中间矩形 + 两端半圆
+            r = H // 2
+            d.rectangle((r, 0, W - r, H), fill=track)
+            d.ellipse((0, 0, H, H), fill=track)
+            d.ellipse((W - H, 0, W, H), fill=track)
+
+            # 滑块
+            pad = 3 * ss
+            knob_d = H - pad * 2
+            cy = H // 2
+            if is_on:
+                cx = W - pad - knob_d // 2
+            else:
+                cx = pad + knob_d // 2
+            d.ellipse((cx - knob_d // 2, cy - knob_d // 2,
+                       cx + knob_d // 2, cy + knob_d // 2),
+                      fill=knob)
+
+            # 缩回原尺寸，LANCZOS 抗锯齿
+            small = img.resize((width, height), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(small)
+            self._toggle_cache[key] = photo
+            return photo
+        except Exception:
+            return None
+
+    def _make_toggle_switch(self, parent, cmd, initial=True,
+                            width=48, height=24):
+        """药丸形拨动开关（toggle switch）。
+           · 圆形抗锯齿通过 Pillow 超采样渲染
+           · 开：药丸紫蓝、滑块白、在右侧
+           · 关：药丸暗灰、滑块灰白、在左侧
+           · 提供 get_value() / set_value() 方法"""
+        canvas = tk.Canvas(parent, width=width, height=height,
+                           bg=self.CARD, highlightthickness=0, bd=0)
+        pad = 3
+        knob_d = height - pad * 2
+        radius = height // 2
+        state = {"value": bool(initial), "hover": False}
+
+        def redraw():
+            canvas.delete("all")
+            v = state["value"]
+
+            # ★ 优先用 Pillow 抗锯齿图
+            photo = self._get_toggle_photo(width, height, v, state["hover"])
+            if photo is not None:
+                canvas.create_image(width // 2, height // 2, image=photo)
+                return
+
+            # 回退方案：无 PIL 时用 Canvas 绘制（有锯齿）
+            if v:
+                track = "#7A7AFF" if state["hover"] else self.ACCENT
+                knob = "#FFFFFF"
+            else:
+                track = "#4A4A6A" if state["hover"] else "#3D3D5C"
+                knob = "#E8E8F0"
+
+            canvas.create_oval(0, 0, height, height,
+                               fill=track, outline="")
+            canvas.create_oval(width - height, 0, width, height,
+                               fill=track, outline="")
+            canvas.create_rectangle(radius, 0, width - radius, height,
+                                    fill=track, outline="")
+
+            cy = height // 2
+            if v:
+                cx = width - pad - knob_d // 2
+            else:
+                cx = pad + knob_d // 2
+            canvas.create_oval(cx - knob_d // 2, cy - knob_d // 2,
+                               cx + knob_d // 2, cy + knob_d // 2,
+                               fill=knob, outline="")
+
+        def on_click(_e):
+            state["value"] = not state["value"]
+            redraw()
+            cmd()
+
+        def on_enter(_e):
+            state["hover"] = True
+            redraw()
+
+        def on_leave(_e):
+            state["hover"] = False
+            redraw()
+
+        def get_value():
+            return state["value"]
+
+        def set_value(v):
+            v = bool(v)
+            if state["value"] == v:
+                return
+            state["value"] = v
+            redraw()
+
+        redraw()
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Enter>", on_enter)
+        canvas.bind("<Leave>", on_leave)
+        canvas.config(cursor="hand2")
+        canvas.get_value = get_value
+        canvas.set_value = set_value
+        return canvas
+
     def _get_circle_photo(self, diameter, color):
-        """Pillow 超采样生成抗锯齿圆，按 (直径, 颜色) 缓存。
-           失败（无 PIL）时返回 None，调用方回退 Canvas 圆。"""
         if not hasattr(self, "_circle_cache"):
             self._circle_cache = {}
         key = (diameter, color)
@@ -1345,7 +1917,7 @@ class ControlPanel:
         if not HAS_PIL:
             return None
         try:
-            ss = 4                          # 4 倍超采样
+            ss = 4
             big = Image.new("RGB", (diameter * ss, diameter * ss), self.BG)
             bd = ImageDraw.Draw(big)
             bd.ellipse((0, 0, diameter * ss - 1, diameter * ss - 1),
@@ -1356,13 +1928,9 @@ class ControlPanel:
             return photo
         except Exception:
             return None
-        
+
     def _make_play_btn(self, parent, text, cmd,
                        diameter=50, font_size=16, primary=False):
-        """圆形播放控制按钮。
-           · 圆形用 Pillow 超采样渲染（抗锯齿边缘）
-           · ▶ ⏸ ◀◀ ▶▶ 全部几何图形绘制，三角形按 bbox 居中 +
-             视觉质心微补偿，播放键精确在圆心"""
         canvas = tk.Canvas(parent, width=diameter, height=diameter,
                            bg=self.BG, highlightthickness=0, bd=0)
         state = {"text": text, "hover": False}
@@ -1379,20 +1947,16 @@ class ControlPanel:
                 fill = self.SEL_BG if state["hover"] else self.CARD
                 fg = self.FG
 
-            # ---- 抗锯齿圆 ----
             photo = self._get_circle_photo(d, fill)
             if photo is not None:
                 canvas.create_image(c, c, image=photo)
-                canvas._circle_photo = photo   # 保引用防 GC
+                canvas._circle_photo = photo
             else:
                 canvas.create_oval(1, 1, d - 1, d - 1, fill=fill, outline="")
 
             txt = state["text"]
 
-            # ---- 图标 ----
             if txt == "▶":
-                # 三角形：bbox 严格居中于 c，
-                # x 方向右移 tri_w*0.1 补偿视觉质心偏左（右尖更显眼）
                 tri_w = font_size * 0.85
                 tri_h = font_size * 1.05
                 ox = tri_w * 0.1
@@ -1466,15 +2030,12 @@ class ControlPanel:
         return canvas
 
     def _make_color_swatch(self, parent, color_key, label_text):
-        """标签在左、圆角正方形色块在右，横向排列。
-           返回 (frame, refresh_callback)"""
         frame = tk.Frame(parent, bg=self.CARD)
 
         tk.Label(frame, text=label_text, bg=self.CARD, fg=self.DIM,
                  font=("Microsoft YaHei UI", 9)).pack(side="left",
                                                      padx=(0, 6))
 
-        # 22×22 圆角正方形色块
         canvas = tk.Canvas(frame, width=22, height=22,
                            bg=self.CARD, highlightthickness=0, bd=0)
         canvas.pack(side="left")

@@ -262,26 +262,64 @@ class LmsClient:
                 for t in res.get("titles_loop", [])]
 
     def search(self, query):
+        """搜索：返回 {tracks, artists, albums} 字典。
+           · tracks: [(id, tracknum, title, artist, album, album_id), ...] 6 元组
+           · artists: [(id, name), ...]
+           · albums:  [(id, name), ...]
+           · 请求 tags:aA l t e —— artist / albumartist / album / tracknum / album_id
+             album_id 是歌曲的必带字段，用于点击专辑时精确加载"""
         q = f"search:{query}"
+        ql = (query or "").strip().lower()
+
+        def _hit(s):
+            if not ql:
+                return True
+            return ql in (s or "").lower()
+
         tracks, artists, albums = [], [], []
+
+        # 歌曲：a=artist A=albumartist l=album t=tracknum e=album_id
         try:
-            res = self.command(["titles", 0, 100, "tags:adt", q], player="-")
-            tracks = [(t.get("id"), t.get("tracknum", 0), t.get("title", ""))
-                      for t in res.get("titles_loop", [])]
+            res = self.command(["titles", 0, 200, "tags:aAlte", q], player="-")
+            for t in res.get("titles_loop", []) or []:
+                tid = t.get("id")
+                tno = t.get("tracknum", 0) or 0
+                tname = t.get("title", "") or ""
+                artist = t.get("artist", "") or ""
+                albumartist = t.get("albumartist", "") or ""
+                album = t.get("album", "") or ""
+                album_id = str(t.get("album_id")
+                               or t.get("albumId") or "")
+                # ★ artist 为空时用 albumartist 兜底，确保歌曲行能显示歌手
+                if not artist and albumartist:
+                    artist = albumartist
+                if _hit(tname) or _hit(artist) or _hit(album):
+                    tracks.append((tid, tno, tname, artist, album, album_id))
         except Exception as e:
             print(f"[搜索] tracks 失败: {e}")
+
+        # 艺人
         try:
-            res = self.command(["artists", 0, 50, "tags:s", q], player="-")
-            artists = [(a.get("id"), a.get("artist") or a.get("name", ""))
-                       for a in res.get("artists_loop", [])]
+            res = self.command(["artists", 0, 100, "tags:s", q], player="-")
+            for a in res.get("artists_loop", []) or []:
+                aid = a.get("id")
+                aname = a.get("artist") or a.get("name", "") or ""
+                if _hit(aname):
+                    artists.append((aid, aname))
         except Exception as e:
             print(f"[搜索] artists 失败: {e}")
+
+        # 专辑
         try:
-            res = self.command(["albums", 0, 50, "tags:al", q], player="-")
-            albums = [(a.get("id"), a.get("album") or a.get("title", ""))
-                      for a in res.get("albums_loop", [])]
+            res = self.command(["albums", 0, 100, "tags:al", q], player="-")
+            for al in res.get("albums_loop", []) or []:
+                alid = al.get("id")
+                alname = al.get("album") or al.get("title", "") or ""
+                if _hit(alname):
+                    albums.append((alid, alname))
         except Exception as e:
             print(f"[搜索] albums 失败: {e}")
+
         return {"artists": artists, "albums": albums, "tracks": tracks}
 
     # ---------- 播放库中歌曲 ----------
@@ -426,19 +464,97 @@ class LmsClient:
     # 在 lms_client.py 的 LmsClient 类中修改此方法
 
     def shutdown_daphile(self):
-        """向 Daphile 发送关机请求（Web 界面实际使用的接口）
-        实际请求: GET http://<host>/cgi-bin/Info?ACTION=shutdown （端口 80）"""
-        url = f"http://{self.host}/cgi-bin/Info?ACTION=shutdown"
+        """关机：优先 Daphile Web CGI，失败自动回退 LMS stopserver。
+           ★ 关键：Daphile 关机 CGI 是阻塞式的，会等待系统关机信号后才
+             返回响应，很容易导致请求超时或连接被主动断开。这两种情况
+             都应视为"请求已成功发出"，设备正在关机，不可再当失败处理。
+           返回 True 表示关机请求已发出（不代表设备已完全断电）。"""
+        urls = [
+            f"http://{self.host}/cgi-bin/Info?ACTION=shutdown",
+            f"http://{self.host}/Daphile/cgi-bin/Info?ACTION=shutdown",
+        ]
+        # 完整浏览器头：UA 太短会被 Daphile 判断为非法请求而静默忽略
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Accept": ("text/html,application/xhtml+xml,application/xml;"
+                       "q=0.9,image/avif,image/webp,*/*;q=0.8"),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "close",
+        }
+
         try:
-            print(f"[关机] 发送请求: {url}")
-            req = urllib.request.Request(
-                url, method="GET",
-                headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                print(f"[关机] 请求成功 (status={resp.status})")
-                return True
+            import requests as _requests
+        except ImportError:
+            _requests = None
+
+        if _requests is not None:
+            sess = _requests.Session()
+            # 预热：访问 Info 主页建立会话（部分 Daphile 版本要求带 cookie）
+            try:
+                sess.get(f"http://{self.host}/cgi-bin/Info",
+                         headers=headers, timeout=4)
+                print("[关机] Web 会话已建立")
+            except Exception as e:
+                print(f"[关机] 预热 Info 页面失败（忽略）: {e}")
+
+            for url in urls:
+                try:
+                    print(f"[关机] GET {url}")
+                    r = sess.get(url, headers={
+                        **headers,
+                        "Referer": f"http://{self.host}/cgi-bin/Info",
+                    }, timeout=6)
+                    print(f"[关机] 响应 status={r.status_code}")
+                    if r.status_code == 200:
+                        body = (r.text or "").strip()
+                        print(f"[关机] 响应片段: {body[:120]!r}")
+                        return True
+                except _requests.exceptions.Timeout as e:
+                    print(f"[关机] 请求超时（设备可能正在关机）: {e}")
+                    return True
+                except _requests.exceptions.ConnectionError as e:
+                    print(f"[关机] 连接断开（设备可能正在关机）: {e}")
+                    return True
+                except Exception as e:
+                    print(f"[关机] CGI 失败 {url}: {e}")
+            sess.close()
+        else:
+            # requests 不可用，回退 urllib
+            for url in urls:
+                try:
+                    print(f"[关机] GET {url} (urllib)")
+                    req = urllib.request.Request(url, method="GET",
+                                                 headers={
+                        **headers,
+                        "Referer": f"http://{self.host}/cgi-bin/Info",
+                    })
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        if resp.status == 200:
+                            print(f"[关机] CGI 成功: {url}")
+                            return True
+                except urllib.error.HTTPError as e:
+                    print(f"[关机] HTTP 错误 {e.code}: {url}")
+                except urllib.error.URLError as e:
+                    reason = getattr(e, "reason", None)
+                    if isinstance(reason, (TimeoutError,
+                                           ConnectionResetError,
+                                           ConnectionRefusedError)):
+                        print(f"[关机] 网络中断（可能设备正在关机）: {e}")
+                        return True
+                    print(f"[关机] URLError: {e}")
+                except Exception as e:
+                    print(f"[关机] 失败 {url}: {e}")
+
+        # ---- 兜底 LMS stopserver ----
+        try:
+            print("[关机] CGI 无效，回退到 LMS stopserver …")
+            res = self.command(["stopserver"], player="")
+            print(f"[关机] stopserver 响应: {res}")
+            return True
         except Exception as e:
-            print(f"[关机] 请求失败: {e}")
+            print(f"[关机] stopserver 也失败: {e}")
             return False
 
     def get_server_mac(self):

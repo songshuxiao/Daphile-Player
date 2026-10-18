@@ -52,12 +52,15 @@ class Config:
     # 手动连接 / 远程唤醒
     HOST_MAC = ""    # Daphile 主机网卡 MAC，用于 WOL
     LAST_IP  = ""    # 上次成功/手动输入的 IP，便于下次预填
-
+    # 更新检查
+    AUTO_CHECK_UPDATE = True    # 启动时是否自动检查更新
+    
     _PERSIST_KEYS = ("COLOR_ACTIVE", "COLOR_IDLE", "COLOR_KEY", "COLOR_STROKE",
                      "FONT_FAMILY", "FONT_SIZE",
                      "OVERLAY_X", "OVERLAY_Y", "OVERLAY_W", "OVERLAY_H",
                      "OVERLAY_VISIBLE",
-                     "HOST_MAC", "LAST_IP")
+                     "HOST_MAC", "LAST_IP",
+                     "AUTO_CHECK_UPDATE")
 
     def __init__(self):
         for k in list(self._PERSIST_KEYS) + \

@@ -35,6 +35,9 @@ class LrcParser:
                 lo = mid + 1
             else:
                 hi = mid - 1
+        # ★ 同一时间戳有多行（原文 + 翻译）时，退回到第一行（原文）高亮
+        while idx > 0 and lines[idx - 1][0] == lines[idx][0]:
+            idx -= 1
         return idx
 
     @staticmethod
