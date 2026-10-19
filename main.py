@@ -2,13 +2,14 @@
 """程序入口：加载配置 →
    ① LAST_IP 快速探测（0.8 秒端口探测 + 取 players）
    ② 成功 → 立即进主界面
-   ③ 失败 → 立即弹连接对话框（手动输入 / 远程唤醒 / 重新扫描）
+   ③ 失败 → 立即弹连接对话框（后台自动发现，可手动输入，可唤醒）
    ④ 连接成功后自动记忆主机 MAC 供下次远程唤醒
    ⑤ 关机后 → 弹连接对话框重连"""
 
 import os
 import sys
 import socket
+import queue
 import threading
 import tkinter as tk
 from tkinter import messagebox
@@ -136,7 +137,7 @@ class ConnectDialog:
     ACCENT = "#5A5AE0"
     ERR    = "#FF8080"
 
-    def __init__(self, parent, cfg):
+    def __init__(self, parent, cfg, auto_scan=False):
         self.cfg = cfg
         self.result = None
         self._busy = False
@@ -158,8 +159,15 @@ class ConnectDialog:
         y = (self.win.winfo_screenheight() - h) // 2
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
+        # ★ 核心修复：跨线程使用 queue 通信
+        self._queue = queue.Queue()
+        self.win.after(100, self._poll_queue)
+
         self._build_ui()
         self.win.after(50, lambda: self.ent_ip.focus_set())
+
+        if auto_scan:
+            self.win.after(200, self._rescan)
 
     def _build_ui(self):
         p = self.win
@@ -260,7 +268,6 @@ class ConnectDialog:
                 pass
 
     def _win_alive(self):
-        """窗口是否存活。★ 只能在主线程调用。"""
         if self._canceled:
             return False
         try:
@@ -268,12 +275,21 @@ class ConnectDialog:
         except (tk.TclError, RuntimeError):
             return False
 
-    def _safe_after(self, delay, func):
-        """跨线程安全调度回主线程。"""
+    def _poll_queue(self):
+        """主线程轮询队列，处理后台线程投递的 UI 更新任务"""
+        if not self._win_alive():
+            return
         try:
-            self.win.after(delay, func)
-        except (tk.TclError, RuntimeError) as e:
-            print(f"[对话框] after 调度失败: {e}")
+            while True:
+                func = self._queue.get_nowait()
+                func()
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"[对话框] 队列任务执行异常: {e}")
+            
+        if self._win_alive():
+            self.win.after(100, self._poll_queue)
 
     def _try_connect(self):
         if self._busy:
@@ -291,29 +307,16 @@ class ConnectDialog:
         self._set_busy(True)
         self._set_status(f"正在连接 {ip}:9000 …", self.ACCENT)
 
-        # 5 秒后仍未返回，显示"响应较慢"提示
         def slow_hint():
             if not self._busy or not self._win_alive():
                 return
             self._set_status(
                 f"正在连接 {ip}:9000 …（响应较慢，请稍候）",
                 self.ACCENT)
-        self._safe_after(5000, slow_hint)
+        # 主线程直接调 after，安全
+        self.win.after(5000, slow_hint)
 
         def work():
-            # ① 先快速探测端口（IP 错误 2 秒内失败）
-            if not _port_open(ip, 9000, timeout=2.0):
-                def fail_port():
-                    if not self._win_alive():
-                        return
-                    self._set_busy(False)
-                    self._set_status(
-                        f"无法连接 {ip}:9000（端口不可达，请检查 IP 是否正确）",
-                        self.ERR)
-                self._safe_after(0, fail_port)
-                return
-
-            # ② 端口通，取 players
             ok, err, players, client = False, "", [], None
             try:
                 client = LmsClient(ip, 9000, self.cfg.PLAYER_MAC)
@@ -345,7 +348,7 @@ class ConnectDialog:
                     self._set_busy(False)
                     self._set_status(f"连接失败：{err}", self.ERR)
 
-            self._safe_after(0, apply)
+            self._queue.put(apply)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -380,7 +383,6 @@ class ConnectDialog:
             self._set_status("魔术包发送失败，请检查 MAC 格式与网络", self.ERR)
 
     def _rescan(self):
-        """扫描网络。★ 后台线程绝不碰 tk 对象，UI 全部走 _safe_after。"""
         if self._scanning:
             return
         self._scanning = True
@@ -398,7 +400,6 @@ class ConnectDialog:
             except Exception as e:
                 print(f"[对话框] 扫描异常: {e}")
 
-            # ★ 直接调度回主线程，不在后台线程检查窗口
             def apply():
                 if not self._win_alive():
                     print("[对话框] 窗口已关闭，丢弃扫描结果")
@@ -420,7 +421,7 @@ class ConnectDialog:
                         "未找到服务器，请手动输入 IP 或点击「远程唤醒」",
                         self.ERR)
 
-            self._safe_after(0, apply)
+            self._queue.put(apply)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -452,7 +453,7 @@ def _handle_daphile_shutdown(cfg, overlay, panel):
     except tk.TclError:
         pass
 
-    dlg = ConnectDialog(overlay.root, cfg)
+    dlg = ConnectDialog(overlay.root, cfg, auto_scan=True)
     result = dlg.wait()
 
     if not result:
@@ -505,14 +506,16 @@ def main():
     _apply_icon(overlay.root)
     overlay.hide()
 
+    # ① LAST_IP 快速探测（最多 0.8 秒）
     print("[启动] 快速探测 LAST_IP…")
     result = _try_last_ip(cfg)
 
     if result is not None:
         host, port, players = result
     else:
-        print("[启动] LAST_IP 未命中，立即弹出连接对话框")
-        dlg = ConnectDialog(overlay.root, cfg)
+        # ② LAST_IP 未命中 → 立即弹出连接对话框（后台自动扫描）
+        print("[启动] LAST_IP 未命中，立即弹出连接对话框（后台自动扫描）")
+        dlg = ConnectDialog(overlay.root, cfg, auto_scan=True)
         discovered = dlg.wait()
         if not discovered:
             print("[启动] 用户取消，退出")
