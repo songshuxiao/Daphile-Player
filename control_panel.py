@@ -612,51 +612,64 @@ class ControlPanel:
         self._apply_theme()
 
     def _apply_theme(self):
-        old = {
-            "BG": self.BG, "CARD": self.CARD, "FIELD": self.FIELD,
-            "FG": self.FG, "DIM": self.DIM, "SEL_BG": self.SEL_BG,
-            "ACCENT": self.ACCENT
-        }
+        # 1. 记录当前（旧）的主题色和即将切换的（新）主题色，建立映射
         if self.cfg.DARK_MODE:
+            old_colors = {
+                "#F0F2F5": "#15151E", "#FFFFFF": "#20202E",
+                "#1A1A24": "#E8E8F0", "#5A5A6A": "#9A9AB0",
+                "#E0E0E8": "#3D3D5C", "#4A4AE0": "#5A5AE0",
+                # 字段兜底映射
+                "#E0E0E8_alt": "#0F0F16", "#1A1A24_alt": "#FFFFFF"
+            }
             self.BG = "#15151E"; self.CARD = "#20202E"; self.FIELD = "#1A1A24"
             self.FG = "#E8E8F0"; self.DIM = "#9A9AB0"; self.SEL_BG = "#3D3D5C"
             self.ACCENT = "#5A5AE0"
         else:
+            old_colors = {
+                "#15151E": "#F0F2F5", "#20202E": "#FFFFFF",
+                "#E8E8F0": "#1A1A24", "#9A9AB0": "#5A5A6A",
+                "#3D3D5C": "#E0E0E8", "#5A5AE0": "#4A4AE0",
+                "#0F0F16": "#E0E0E8", "#FFFFFF": "#1A1A24" # 图标提亮/加深
+            }
             self.BG = "#F0F2F5"; self.CARD = "#FFFFFF"; self.FIELD = "#FFFFFF"
             self.FG = "#1A1A24"; self.DIM = "#5A5A6A"; self.SEL_BG = "#E0E0E8"
             self.ACCENT = "#4A4AE0"
-            
-        new = {
-            "BG": self.BG, "CARD": self.CARD, "FIELD": self.FIELD,
-            "FG": self.FG, "DIM": self.DIM, "SEL_BG": self.SEL_BG,
-            "ACCENT": self.ACCENT
-        }
 
+        # 2. 更新主窗口背景
         self.panel.configure(bg=self.BG)
-        self._recolor_widgets(self.panel, old, new)
-        self._build_style()
-        self._update_custom_widgets(self.panel)
 
-        # 清理图片缓存触发刷新
+        # 3. 遍历所有原生控件（Label, Frame, Entry 等），把旧颜色映射为新颜色
+        self._recolor_widgets(self.panel, old_colors)
+
+        # 4. 重建 ttk 样式（Notebook, Combobox, Treeview 等）
+        self._build_style()
+
+        # 5. 清理缓存的抗锯齿图片（旧颜色的圆和药丸）
         if hasattr(self, "_toggle_cache"): self._toggle_cache.clear()
         if hasattr(self, "_circle_cache"): self._circle_cache.clear()
         self._icon_cache.clear()
-        self._lib_refresh()  # 重新加载图标
 
-    def _recolor_widgets(self, widget, old, new):
-        old_map = {v: k for k, v in old.items()}
+        # 6. 遍历所有自定义控件（进度条、圆角按钮等），触发它们重绘
+        self._update_custom_widgets(self.panel)
+
+        # 7. 重新加载图标
+        self._lib_refresh()
+
+    def _recolor_widgets(self, widget, mapping):
+        """递归遍历控件，替换颜色"""
         try:
             for prop in ("bg", "fg", "activebackground", "activeforeground", 
-                         "highlightbackground", "highlightcolor", "insertbackground", "buttonbackground"):
+                         "highlightbackground", "highlightcolor", "insertbackground", 
+                         "buttonbackground", "troughcolor"):
                 if prop in widget.keys():
                     val = widget.cget(prop)
-                    if val in old_map:
-                        key = old_map[val]
-                        widget.configure(**{prop: new[key]})
+                    if val in mapping:
+                        widget.configure(**{prop: mapping[val]})
         except Exception:
             pass
+        
         for child in widget.winfo_children():
-            self._recolor_widgets(child, old, new)
+            self._recolor_widgets(child, mapping)
 
     def _update_custom_widgets(self, widget):
         if hasattr(widget, "_update_theme"):
@@ -1738,7 +1751,74 @@ class ControlPanel:
                 self.btn_lyrics.set_text("○ 桌面歌词")
         except Exception:
             pass
+    
+    def _get_circle_photo(self, diameter, color):
+        """Pillow 超采样生成抗锯齿圆，按 (直径, 颜色) 缓存。"""
+        if not hasattr(self, "_circle_cache"):
+            self._circle_cache = {}
+        key = (diameter, color)
+        if key in self._circle_cache:
+            return self._circle_cache[key]
+        if not HAS_PIL:
+            return None
+        try:
+            ss = 4
+            big = Image.new("RGB", (diameter * ss, diameter * ss), self.BG)
+            bd = ImageDraw.Draw(big)
+            bd.ellipse((0, 0, diameter * ss - 1, diameter * ss - 1), fill=color)
+            small = big.resize((diameter, diameter), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(small)
+            self._circle_cache[key] = photo
+            return photo
+        except Exception:
+            return None
 
+    def _get_toggle_photo(self, width, height, is_on, is_hover):
+        """Pillow 超采样生成抗锯齿药丸开关图，按 (尺寸, 状态) 缓存。"""
+        if not hasattr(self, "_toggle_cache"):
+            self._toggle_cache = {}
+        key = (width, height, is_on, is_hover)
+        if key in self._toggle_cache:
+            return self._toggle_cache[key]
+        if not HAS_PIL:
+            return None
+        try:
+            ss = 4
+            W = width * ss
+            H = height * ss
+            if is_on:
+                track = "#7A7AFF" if is_hover else self.ACCENT
+                knob = "#FFFFFF"
+            else:
+                track = "#4A4A6A" if is_hover else ("#D0D0D8" if not self.cfg.DARK_MODE else "#3D3D5C")
+                knob = self.ACCENT
+
+            img = Image.new("RGB", (W, H), self.CARD)
+            d = ImageDraw.Draw(img)
+
+            r = H // 2
+            d.rectangle((r, 0, W - r, H), fill=track)
+            d.ellipse((0, 0, H, H), fill=track)
+            d.ellipse((W - H, 0, W, H), fill=track)
+
+            pad = 3 * ss
+            knob_d = H - pad * 2
+            cy = H // 2
+            if is_on:
+                cx = W - pad - knob_d // 2
+            else:
+                cx = pad + knob_d // 2
+            d.ellipse((cx - knob_d // 2, cy - knob_d // 2,
+                       cx + knob_d // 2, cy + knob_d // 2),
+                      fill=knob)
+
+            small = img.resize((width, height), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(small)
+            self._toggle_cache[key] = photo
+            return photo
+        except Exception:
+            return None
+        
     # ================= 美化控件工厂 =================
     def _make_round_btn(self, parent, text, cmd, width=112, height=22, radius=8, bg=None, btn_bg=None):
         canvas = tk.Canvas(parent, width=width, height=height,
@@ -1783,7 +1863,15 @@ class ControlPanel:
 
         canvas.set_text = set_text
         canvas.set_state = set_state
-        canvas._update_theme = lambda panel: (canvas.configure(bg=panel.BG), redraw())
+        def _update_theme(panel):
+            nonlocal bg, btn_bg
+            if bg is not None:
+                bg = panel.BG
+                canvas.configure(bg=bg)
+            if btn_bg is not None:
+                btn_bg = panel.CARD
+            redraw()
+        canvas._update_theme = _update_theme
 
         canvas.bind("<Button-1>", on_click)
         canvas.bind("<Enter>", on_enter)
@@ -1802,6 +1890,14 @@ class ControlPanel:
         def redraw():
             canvas.delete("all")
             v = state["value"]
+            
+            # ★ 优先使用抗锯齿图
+            photo = self._get_toggle_photo(width, height, v, state["hover"])
+            if photo is not None:
+                canvas.create_image(width // 2, height // 2, image=photo)
+                return
+
+            # 回退方案
             if v:
                 track = "#7A7AFF" if state["hover"] else self.ACCENT
                 knob = "#FFFFFF"
@@ -1857,7 +1953,14 @@ class ControlPanel:
                 fill = self.SEL_BG if state["hover"] else self.CARD
                 fg = self.FG
 
-            canvas.create_oval(1, 1, d - 1, d - 1, fill=fill, outline="")
+            # ★ 优先使用抗锯齿图
+            photo = self._get_circle_photo(d, fill)
+            if photo is not None:
+                canvas.create_image(c, c, image=photo)
+                canvas._circle_photo = photo
+            else:
+                canvas.create_oval(1, 1, d - 1, d - 1, fill=fill, outline="")
+
             txt = state["text"]
 
             if txt == "▶":
@@ -1939,9 +2042,10 @@ class ControlPanel:
 
         def _update_theme(panel):
             frame.configure(bg=panel.CARD)
-            lbl.configure(bg=panel.CARD, fg=panel.DIM)
+            lbl.configure(bg=panel.CARD, fg=panel.DIM)  # ★ 关键：更新标签颜色
             canvas.configure(bg=panel.CARD)
             redraw()
+        canvas._update_theme = _update_theme
 
         canvas._update_theme = _update_theme
         canvas.bind("<Button-1>", on_click)
