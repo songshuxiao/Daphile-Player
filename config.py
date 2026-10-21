@@ -46,6 +46,9 @@ class Config:
     COLOR_STROKE = "#B8B8C4"
     OVERLAY_VISIBLE = True      # 桌面歌词浮窗是否显示（持久化）
 
+    # ★ 新增：深色模式
+    DARK_MODE = True
+
     SCAN_PORTS = (9000, 80)
     MAX_DOWNLOAD_MB = 20
 
@@ -58,7 +61,7 @@ class Config:
     _PERSIST_KEYS = ("COLOR_ACTIVE", "COLOR_IDLE", "COLOR_KEY", "COLOR_STROKE",
                      "FONT_FAMILY", "FONT_SIZE",
                      "OVERLAY_X", "OVERLAY_Y", "OVERLAY_W", "OVERLAY_H",
-                     "OVERLAY_VISIBLE",
+                     "OVERLAY_VISIBLE","DARK_MODE",
                      "HOST_MAC", "LAST_IP",
                      "AUTO_CHECK_UPDATE")
 

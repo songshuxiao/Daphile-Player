@@ -84,6 +84,11 @@ class LmsClient:
             print(f"[LMS] 播放器 MAC 解析失败: {e}")
         return self._mac
 
+    def set_player_mac(self, mac):
+        """切换目标播放器 MAC"""
+        self._mac = mac or ""
+        print(f"[LMS] 切换播放器至: {self._mac}")
+
     def command(self, cmd, player=None, retries=3):
         target = player if player is not None else (self.player_mac() or "-")
         return self._post(target, cmd, retries)
