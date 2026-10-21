@@ -193,12 +193,11 @@ class CanvasSlider(tk.Canvas):
         self._redraw()
 
     def _update_theme(self, panel):
-        # 让滑块的颜色随主题变化
         self.configure(bg=panel.BG)
         self._trough = "#E0E0E8" if not panel.cfg.DARK_MODE else "#0F0F16"
         self._fill = panel.ACCENT
         self._thumb = panel.ACCENT
-        self._thumb_hover = "#FFFFFF" if panel.cfg.DARK_MODE else "#4A4AE0"
+        self._thumb_hover = "#7A7AFF"
         self._redraw()
 
 
@@ -210,15 +209,18 @@ class ControlPanel:
         self.fetcher = fetcher
         self.cfg = cfg
 
-        # 初始化主题变量
         if getattr(self.cfg, "DARK_MODE", True):
             self.BG = "#15151E"; self.CARD = "#20202E"; self.FIELD = "#1A1A24"
             self.FG = "#E8E8F0"; self.DIM = "#9A9AB0"; self.SEL_BG = "#3D3D5C"
             self.ACCENT = "#5A5AE0"
+            self.HOVER_BG = "#3D3D5C"
+            self.HOVER_ACCENT = "#7A7AFF"
         else:
             self.BG = "#F0F2F5"; self.CARD = "#FFFFFF"; self.FIELD = "#FFFFFF"
             self.FG = "#1A1A24"; self.DIM = "#5A5A6A"; self.SEL_BG = "#E0E0E8"
             self.ACCENT = "#4A4AE0"
+            self.HOVER_BG = "#E0E0E8"
+            self.HOVER_ACCENT = "#7A7AFF"
 
         self.track_info = {}
         self.song_pos = 0.0
@@ -233,7 +235,6 @@ class ControlPanel:
         self._vol_dragging = False
         self._last_overlay_vis = None
 
-        # 播放器切换
         self._available_players = []
         self._last_players_check = 0.0
         self._known_player_macs = set()
@@ -286,6 +287,15 @@ class ControlPanel:
             style.theme_use("clam")
         except tk.TclError:
             pass
+        
+        # ★ 去掉 Notebook 的焦点虚线框（蚂蚁线）
+        style.layout("TNotebook.Tab", [
+            ("Notebook.tab", {"sticky": "nswe", "children": [
+                ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                    ("Notebook.label", {"side": "top", "sticky": ""})
+                ]})
+            ]})
+        ])
 
         style.configure(".", background=self.BG, foreground=self.FG,
                         fieldbackground=self.FIELD, borderwidth=0)
@@ -423,7 +433,7 @@ class ControlPanel:
         self.progress = CanvasSlider(
             f1, from_=0, to=100, value=0,
             bg=self.BG, trough="#0F0F16" if self.cfg.DARK_MODE else "#E0E0E8",
-            fill=self.ACCENT, thumb=self.ACCENT, thumb_hover="#7A7AFF" if self.cfg.DARK_MODE else "#4A4AE0",
+            fill=self.ACCENT, thumb=self.ACCENT, thumb_hover="#7A7AFF",
             height=22, track_height=6, thumb_radius=8,
             on_drag_start=self._seek_start, on_drag_end=self._seek_end)
         self.progress.pack(fill="x", pady=(4, 0))
@@ -453,7 +463,7 @@ class ControlPanel:
         self.scl_vol = CanvasSlider(
             vol_row, from_=0, to=100, value=50,
             bg=self.BG, trough="#0F0F16" if self.cfg.DARK_MODE else "#E0E0E8",
-            fill=self.ACCENT, thumb=self.ACCENT, thumb_hover="#7A7AFF" if self.cfg.DARK_MODE else "#4A4AE0",
+            fill=self.ACCENT, thumb=self.ACCENT, thumb_hover="#7A7AFF",
             height=22, track_height=6, thumb_radius=8,
             command=self._on_volume,
             on_drag_start=self._on_vol_drag_start,
@@ -498,11 +508,9 @@ class ControlPanel:
             r1, "COLOR_STROKE", "描边色")
         frame_c.grid(row=0, column=2, sticky="w")
 
-        # 关于按钮：在 LabelFrame 外部右下角
         about_row = tk.Frame(self.ap_container, bg=self.BG)
         about_row.pack(fill="x", pady=(4, 0))
 
-        # ★ 深色模式开关
         self._theme_toggle = self._make_toggle_switch(
             about_row, self._toggle_theme, 
             initial=bool(getattr(self.cfg, "DARK_MODE", True)),
@@ -612,51 +620,68 @@ class ControlPanel:
         self._apply_theme()
 
     def _apply_theme(self):
-        # 1. 记录当前（旧）的主题色和即将切换的（新）主题色，建立映射
         if self.cfg.DARK_MODE:
             old_colors = {
                 "#F0F2F5": "#15151E", "#FFFFFF": "#20202E",
                 "#1A1A24": "#E8E8F0", "#5A5A6A": "#9A9AB0",
-                "#E0E0E8": "#3D3D5C", "#4A4AE0": "#5A5AE0",
-                # 字段兜底映射
-                "#E0E0E8_alt": "#0F0F16", "#1A1A24_alt": "#FFFFFF"
+                "#E0E0E8": "#3D3D5C", "#4A4AE0": "#5A5AE0"
             }
             self.BG = "#15151E"; self.CARD = "#20202E"; self.FIELD = "#1A1A24"
             self.FG = "#E8E8F0"; self.DIM = "#9A9AB0"; self.SEL_BG = "#3D3D5C"
             self.ACCENT = "#5A5AE0"
+            self.HOVER_BG = "#3D3D5C"
+            self.HOVER_ACCENT = "#7A7AFF"
         else:
             old_colors = {
                 "#15151E": "#F0F2F5", "#20202E": "#FFFFFF",
                 "#E8E8F0": "#1A1A24", "#9A9AB0": "#5A5A6A",
-                "#3D3D5C": "#E0E0E8", "#5A5AE0": "#4A4AE0",
-                "#0F0F16": "#E0E0E8", "#FFFFFF": "#1A1A24" # 图标提亮/加深
+                "#3D3D5C": "#E0E0E8", "#5A5AE0": "#4A4AE0"
             }
             self.BG = "#F0F2F5"; self.CARD = "#FFFFFF"; self.FIELD = "#FFFFFF"
             self.FG = "#1A1A24"; self.DIM = "#5A5A6A"; self.SEL_BG = "#E0E0E8"
             self.ACCENT = "#4A4AE0"
+            self.HOVER_BG = "#E0E0E8"
+            self.HOVER_ACCENT = "#7A7AFF"
 
-        # 2. 更新主窗口背景
         self.panel.configure(bg=self.BG)
-
-        # 3. 遍历所有原生控件（Label, Frame, Entry 等），把旧颜色映射为新颜色
         self._recolor_widgets(self.panel, old_colors)
-
-        # 4. 重建 ttk 样式（Notebook, Combobox, Treeview 等）
         self._build_style()
 
-        # 5. 清理缓存的抗锯齿图片（旧颜色的圆和药丸）
         if hasattr(self, "_toggle_cache"): self._toggle_cache.clear()
         if hasattr(self, "_circle_cache"): self._circle_cache.clear()
         self._icon_cache.clear()
 
-        # 6. 遍历所有自定义控件（进度条、圆角按钮等），触发它们重绘
         self._update_custom_widgets(self.panel)
-
-        # 7. 重新加载图标
         self._lib_refresh()
+        # ★ 强制更新特定控件的颜色（修复颜色映射冲突导致的背景/文字异常）
+        try:
+            # 1. 字号输入框和搜索框（背景用 FIELD，文字用 FG）
+            self.spn_size.config(
+                bg=self.FIELD, fg=self.FG, 
+                buttonbackground=self.CARD, 
+                insertbackground=self.FG
+            )
+            self.ent_search.config(
+                bg=self.FIELD, fg=self.FG, 
+                insertbackground=self.FG,
+                highlightbackground=self.SEL_BG, 
+                highlightcolor=self.ACCENT
+            )
+            
+            # 2. 所有标签（确保它们的底色和文字对比正确）
+            self.lbl_title.config(bg=self.CARD, fg=self.FG)
+            self.lbl_artist.config(bg=self.CARD, fg=self.DIM)
+            self.lbl_time.config(bg=self.BG, fg=self.DIM)
+            self.lbl_server.config(bg=self.BG, fg=self.ACCENT)
+            self.lbl_player.config(bg=self.BG, fg=self.DIM)
+            self.lbl_hdr_artists.config(bg=self.BG, fg=self.DIM)
+            self.lbl_hdr_albums.config(bg=self.BG, fg=self.DIM)
+            self.lbl_hdr_tracks.config(bg=self.BG, fg=self.DIM)
+            self.lbl_lib.config(bg=self.BG, fg=self.DIM)
+        except Exception:
+            pass
 
     def _recolor_widgets(self, widget, mapping):
-        """递归遍历控件，替换颜色"""
         try:
             for prop in ("bg", "fg", "activebackground", "activeforeground", 
                          "highlightbackground", "highlightcolor", "insertbackground", 
@@ -968,7 +993,7 @@ class ControlPanel:
 
         self._about_check_btn = self._make_round_btn(
             btns, "检查更新", lambda: self._check_update(auto=False),
-            width=96, height=28, radius=10, bg=self.BG, btn_bg=self.CARD)
+            width=96, height=28, radius=10)
         self._about_check_btn.pack(side="left")
 
         tk.Label(btns, text="自动检查更新", bg=self.BG, fg=self.DIM,
@@ -1151,7 +1176,6 @@ class ControlPanel:
         c = self.cover_canvas
         c.delete("all")
         cx = cy = 36
-        # 这里尽量保留黑胶唱片质感，不随主题大幅度变化
         c.create_oval(cx - 32, cy - 32, cx + 32, cy + 32,
                       fill="#2A2A3A" if self.cfg.DARK_MODE else "#D0D0D8", 
                       outline="#3D3D5C", width=2)
@@ -1787,10 +1811,10 @@ class ControlPanel:
             W = width * ss
             H = height * ss
             if is_on:
-                track = "#7A7AFF" if is_hover else self.ACCENT
+                track = self.HOVER_ACCENT if is_hover else self.ACCENT
                 knob = "#FFFFFF"
             else:
-                track = "#4A4A6A" if is_hover else ("#D0D0D8" if not self.cfg.DARK_MODE else "#3D3D5C")
+                track = self.HOVER_BG if is_hover else ("#D0D0D8" if not self.cfg.DARK_MODE else "#3D3D5C")
                 knob = self.ACCENT
 
             img = Image.new("RGB", (W, H), self.CARD)
@@ -1821,17 +1845,22 @@ class ControlPanel:
         
     # ================= 美化控件工厂 =================
     def _make_round_btn(self, parent, text, cmd, width=112, height=22, radius=8, bg=None, btn_bg=None):
+        canvas_bg = bg if bg is not None else self.BG
+        button_bg = btn_bg if btn_bg is not None else self.CARD
+        
         canvas = tk.Canvas(parent, width=width, height=height,
-                           bg=bg if bg else self.BG, highlightthickness=0, bd=0)
+                           bg=canvas_bg, highlightthickness=0, bd=0)
         state = {"text": text, "hover": False, "enabled": True}
 
         def redraw():
             canvas.delete("all")
-            canvas_bg = bg if bg else self.BG
-            button_bg = btn_bg if btn_bg else self.CARD
-            
             if state["hover"]:
-                bg_color = self.ACCENT if button_bg == self.SEL_BG else self.SEL_BG
+                if button_bg == self.ACCENT:
+                    bg_color = self.HOVER_ACCENT
+                elif button_bg == self.CARD:
+                    bg_color = self.HOVER_BG
+                else:
+                    bg_color = self.SEL_BG
             else:
                 bg_color = button_bg
             fg_color = self.FG if state["enabled"] else self.DIM
@@ -1864,12 +1893,10 @@ class ControlPanel:
         canvas.set_text = set_text
         canvas.set_state = set_state
         def _update_theme(panel):
-            nonlocal bg, btn_bg
-            if bg is not None:
-                bg = panel.BG
-                canvas.configure(bg=bg)
-            if btn_bg is not None:
-                btn_bg = panel.CARD
+            nonlocal canvas_bg, button_bg
+            canvas_bg = panel.BG
+            button_bg = panel.CARD
+            canvas.configure(bg=canvas_bg)
             redraw()
         canvas._update_theme = _update_theme
 
@@ -1891,18 +1918,16 @@ class ControlPanel:
             canvas.delete("all")
             v = state["value"]
             
-            # ★ 优先使用抗锯齿图
             photo = self._get_toggle_photo(width, height, v, state["hover"])
             if photo is not None:
                 canvas.create_image(width // 2, height // 2, image=photo)
                 return
 
-            # 回退方案
             if v:
-                track = "#7A7AFF" if state["hover"] else self.ACCENT
+                track = self.HOVER_ACCENT if state["hover"] else self.ACCENT
                 knob = "#FFFFFF"
             else:
-                track = "#4A4A6A" if state["hover"] else ("#D0D0D8" if not self.cfg.DARK_MODE else "#3D3D5C")
+                track = self.HOVER_BG if state["hover"] else ("#D0D0D8" if not self.cfg.DARK_MODE else "#3D3D5C")
                 knob = self.ACCENT
                 
             canvas.create_oval(0, 0, height, height, fill=track, outline="")
@@ -1953,7 +1978,6 @@ class ControlPanel:
                 fill = self.SEL_BG if state["hover"] else self.CARD
                 fg = self.FG
 
-            # ★ 优先使用抗锯齿图
             photo = self._get_circle_photo(d, fill)
             if photo is not None:
                 canvas.create_image(c, c, image=photo)
@@ -2042,12 +2066,11 @@ class ControlPanel:
 
         def _update_theme(panel):
             frame.configure(bg=panel.CARD)
-            lbl.configure(bg=panel.CARD, fg=panel.DIM)  # ★ 关键：更新标签颜色
+            lbl.configure(bg=panel.CARD, fg=panel.DIM)
             canvas.configure(bg=panel.CARD)
             redraw()
         canvas._update_theme = _update_theme
 
-        canvas._update_theme = _update_theme
         canvas.bind("<Button-1>", on_click)
         canvas.bind("<Enter>", on_enter)
         canvas.bind("<Leave>", on_leave)
