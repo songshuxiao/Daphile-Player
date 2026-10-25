@@ -164,7 +164,23 @@ class LmsClient:
         self.command(["mixer", "volume", str(int(val))])
 
     def seek(self, sec):
-        self.command(["time", str(int(sec))])
+        """seek 到指定秒。
+           ★ 暂停态用 time <sec> 0 —— LMS 会把 stream 指针移到新位置，
+             但 rate 保持 0，全程不发声；
+           ★ 播放态用 time <sec> 1 —— 立即跳到新位置并继续播放。
+           ★ 绝不使用 pause 0 → time → pause 1 的旧方案，避免短暂出声。"""
+        sec = int(sec)
+        try:
+            st = self.command(["status", 0, 0])
+            mode = st.get("mode", "") or ""
+        except Exception:
+            mode = ""
+
+        if mode == "pause":
+            print(f"[seek] 暂停态跳转: {sec}s (rate=0，不发声)")
+            self.command(["time", str(sec), "0"])
+        else:
+            self.command(["time", str(sec), "1"])
 
     def next_track(self):
         self._jump(+1)

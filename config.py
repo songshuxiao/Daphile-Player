@@ -57,13 +57,17 @@ class Config:
     LAST_IP  = ""    # 上次成功/手动输入的 IP，便于下次预填
     # 更新检查
     AUTO_CHECK_UPDATE = True    # 启动时是否自动检查更新
-    
+    # 键盘步进（可在设置面板调整）
+    SEEK_STEP = 5    # 左右键 seek 步进（秒），默认 5
+    VOL_STEP  = 2    # 上下键音量步进（%），默认 2
+
     _PERSIST_KEYS = ("COLOR_ACTIVE", "COLOR_IDLE", "COLOR_KEY", "COLOR_STROKE",
                      "FONT_FAMILY", "FONT_SIZE",
                      "OVERLAY_X", "OVERLAY_Y", "OVERLAY_W", "OVERLAY_H",
                      "OVERLAY_VISIBLE","DARK_MODE",
                      "HOST_MAC", "LAST_IP",
-                     "AUTO_CHECK_UPDATE")
+                     "AUTO_CHECK_UPDATE",
+                     "SEEK_STEP", "VOL_STEP")
 
     def __init__(self):
         for k in list(self._PERSIST_KEYS) + \

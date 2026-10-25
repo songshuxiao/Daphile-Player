@@ -22,7 +22,7 @@ except ImportError:
     HAS_PIL = False
 
 
-APP_VERSION = "v4.0.0"
+APP_VERSION = "v5.0.0"
 APP_REPO = "songshuxiao/Daphile-Player"
 GITHUB_URL = f"https://github.com/{APP_REPO}"
 RELEASES_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
@@ -228,12 +228,15 @@ class ControlPanel:
         self._seeking = False
         self.lines = []
         self.cur_line_idx = -1
+        self._last_idx = -1
         self._lyrics_source = ""
         self._fetch_token = 0
         self._playing = False
         self.player_name = ""
         self._vol_dragging = False
         self._last_overlay_vis = None
+        self._last_play_press = 0
+        self._last_seek_ts = 0.0        # ★ 最近一次 seek 的时间戳
 
         self._available_players = []
         self._last_players_check = 0.0
@@ -254,6 +257,10 @@ class ControlPanel:
         self._lib_album_token = 0
         self._lib_track_token = 0
 
+        # 键盘导航标志位
+        self._kb_focus_albums = False
+        self._kb_select_tracks = False
+
         self._update_checking = False
         self._about_status_lbl = None
         self._about_auto_toggle = None
@@ -273,12 +280,323 @@ class ControlPanel:
         except tk.TclError:
             pass
 
+        # 绑定键盘全局事件
+        self.panel.bind("<KeyPress>", self._on_key_press)
+        # ★ 点击面板上任意非输入控件时，主动把焦点从 Spinbox/Entry 移开
+        self.panel.bind("<Button-1>", self._on_panel_click, add="+")
+
         self._stop = False
         threading.Thread(target=self._poll_loop, daemon=True).start()
         self._ui_tick_loop()
 
         if getattr(self.cfg, "AUTO_CHECK_UPDATE", True):
             self.panel.after(3000, lambda: self._check_update(auto=True))
+
+    # ================= 键盘快捷键 =================
+    def _on_key_press(self, event):
+        w = event.widget
+        # 如果焦点在输入框/微调框/下拉框里，不拦截，让用户可以正常打字
+        if isinstance(w, (tk.Entry, ttk.Entry, tk.Spinbox, ttk.Combobox, tk.Text)):
+            return None
+
+        # Tab 切换标签页
+        if event.keysym == "Tab":
+            cur = self.nb.index(self.nb.select())
+            new_tab = 1 if cur == 0 else 0
+            self.nb.select(new_tab)
+            if new_tab == 1:
+                # 切到音乐库：焦点还给用户最后操作的那一列
+                try:
+                    self.panel.update_idletasks()
+                    self._focus_library_tree()
+                except tk.TclError:
+                    pass
+            else:
+                # 切回播放中：把焦点从树移开，避免残留焦点干扰方向键
+                try:
+                    self.panel.focus_set()
+                except tk.TclError:
+                    pass
+            return "break"
+
+        try:
+            cur_tab = self.nb.index(self.nb.select())
+        except (tk.TclError, ValueError):
+            return None
+
+        if cur_tab == 0:
+            # ---- 播放中标签页：左/右 seek，上/下音量，空格暂停 ----
+            if event.keysym == "space":
+                self._toggle_play()
+                return "break"
+            elif event.keysym == "Up":
+                step = max(1, int(getattr(self.cfg, "VOL_STEP", 5)))
+                vol = min(100, int(self.scl_vol.get() + step))
+                self.scl_vol.set(vol)
+                self._on_volume(str(vol))
+                return "break"
+            elif event.keysym == "Down":
+                step = max(1, int(getattr(self.cfg, "VOL_STEP", 5)))
+                vol = max(0, int(self.scl_vol.get() - step))
+                self.scl_vol.set(vol)
+                self._on_volume(str(vol))
+                return "break"
+            elif event.keysym == "Left":
+                step = max(1, int(getattr(self.cfg, "SEEK_STEP", 5)))
+                pos = max(0, self.song_pos - step)
+                self.progress.set(pos)
+                self.song_pos = pos
+                self._last_seek_ts = time.time()
+
+                def work_l(p=pos):
+                    try:
+                        self.lms.seek(p)
+                    except Exception:
+                        traceback.print_exc()
+                threading.Thread(target=work_l, daemon=True).start()
+                return "break"
+            elif event.keysym == "Right":
+                step = max(1, int(getattr(self.cfg, "SEEK_STEP", 5)))
+                pos = min(self._duration, self.song_pos + step) if self._duration else self.song_pos + step
+                self.progress.set(pos)
+                self.song_pos = pos
+                self._last_seek_ts = time.time()
+
+                def work_r(p=pos):
+                    try:
+                        self.lms.seek(p)
+                    except Exception:
+                        traceback.print_exc()
+                threading.Thread(target=work_r, daemon=True).start()
+                return "break"
+        else:
+            # ---- 音乐库标签页：拦截方向键，防止 ttk.Notebook 默认绑定切换标签 ----
+            # 焦点在树控件上时由各 tree 的 widget bind 先行处理，不会走到这里
+            if event.keysym in ("Left", "Right"):
+                return "break"
+        return None
+
+    # ---- 焦点管理：避免输入框吞掉上下左右键 ----
+    @staticmethod
+    def _is_input_widget(w):
+        """判断是否为输入类控件（其内部按键不应被全局拦截）"""
+        if w is None:
+            return False
+        try:
+            return isinstance(w, (tk.Entry, ttk.Entry, tk.Spinbox,
+                                  getattr(ttk, "Spinbox", tk.Spinbox),
+                                  ttk.Combobox, tk.Text))
+        except (AttributeError, tk.TclError):
+            return False
+
+    def _commit_spinbox(self, _e=None):
+        """Spinbox 内按 Enter / ESC：提交当前输入并交还焦点给 panel，
+           之后上下左右键可正常调进度/音量"""
+        try:
+            self._on_seek_step_change()
+            self._on_vol_step_change()
+        except Exception:
+            pass
+        try:
+            self.panel.focus_set()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _on_panel_click(self, event):
+        """点击面板空白处（非输入控件）时把焦点从 Spinbox/Entry 移开"""
+        w = event.widget
+        if self._is_input_widget(w):
+            return None
+        try:
+            cur = self.panel.focus_get()
+        except (tk.TclError, KeyError):
+            cur = None
+        if self._is_input_widget(cur):
+            # 失焦前先提交输入
+            try:
+                self._on_seek_step_change()
+                self._on_vol_step_change()
+            except Exception:
+                pass
+            try:
+                self.panel.focus_set()
+            except tk.TclError:
+                pass
+        return None
+
+    def _in_library(self):
+        """当前是否在音乐库标签页"""
+        try:
+            return self.nb.index(self.nb.select()) == 1
+        except (tk.TclError, ValueError, AttributeError):
+            return False
+
+    def _focus_library_tree(self):
+        """Tab 切回音乐库：把焦点还给用户最后操作的那一层
+           优先级：歌曲（有选中） > 专辑（有选中） > 歌手（默认）"""
+        try:
+            if self.tree_tracks.selection():
+                self.tree_tracks.focus_set()
+                return
+            if self.tree_albums.selection():
+                self.tree_albums.focus_set()
+                return
+            self.tree_artists.focus_set()
+        except tk.TclError:
+            pass
+        
+    def _kb_artist_left(self, event):
+        """歌手列按左：音乐库标签页内无操作；不在音乐库时交给全局键盘处理"""
+        if not self._in_library():
+            return self._on_key_press(event)
+        return "break"  # 歌手列左键无操作，不取消高亮
+
+    def _kb_artist_down(self, event):
+        """歌手列按下：若尚无选中项，则选中第一个歌手；否则交给默认下移行为"""
+        if not self._in_library():
+            return self._on_key_press(event)
+        children = self.tree_artists.get_children()
+        if not children:
+            return "break"
+        if not self.tree_artists.selection():
+            self.tree_artists.selection_set(children[0])
+            self.tree_artists.focus(children[0])
+            return "break"
+        # 已有选中：不拦截，让 Treeview 默认行为移动到下一项
+        return None
+    
+    def _kb_artist_right(self, event):
+        """歌手列按右/回车：选中歌手 -> 展开专辑并高亮第一张 -> 展开歌曲(不选中)"""
+        if not self._in_library():
+            return self._on_key_press(event)
+        children = self.tree_artists.get_children()
+        if not children:
+            return "break"
+            
+        sel = self.tree_artists.selection()
+        if not sel:
+            self.tree_artists.selection_set(children[0])
+            self.tree_artists.focus(children[0])
+            self._on_artist_selected()
+            
+        self._set_headers("albums")
+        self.tree_albums.focus_set()
+        
+        album_children = self.tree_albums.get_children()
+        if album_children:
+            self.tree_albums.selection_set(album_children[0])
+            self.tree_albums.focus(album_children[0])
+            self._kb_select_tracks = False
+            self._on_album_selected()
+        else:
+            self._kb_focus_albums = True
+            
+        return "break"
+
+    def _kb_album_right(self, event):
+        """专辑列按右/回车：选中专辑 -> 展开歌曲并高亮第一首"""
+        if not self._in_library():
+            return self._on_key_press(event)
+        children = self.tree_albums.get_children()
+        if not children:
+            return "break"
+            
+        sel = self.tree_albums.selection()
+        if not sel:
+            self.tree_albums.selection_set(children[0])
+            self.tree_albums.focus(children[0])
+            self._on_album_selected()
+            
+        self._set_headers("tracks")
+        self.tree_tracks.focus_set()
+        
+        track_children = self.tree_tracks.get_children()
+        if track_children:
+            self.tree_tracks.selection_set(track_children[0])
+            self.tree_tracks.focus(track_children[0])
+        else:
+            self._kb_select_tracks = True
+            
+        return "break"
+
+    def _kb_track_left(self, event):
+        """歌曲列按左：只取消歌曲高亮，焦点回到专辑列。
+           ★ 保留歌曲/专辑列展开；保留专辑原有高亮（若无选中则自动选中第一张）。"""
+        if not self._in_library():
+            return self._on_key_press(event)
+        self.tree_tracks.selection_remove(self.tree_tracks.selection())
+        if not self.tree_albums.selection():
+            album_children = self.tree_albums.get_children()
+            if album_children:
+                self.tree_albums.selection_set(album_children[0])
+                self.tree_albums.focus(album_children[0])
+        else:
+            self.tree_albums.focus(self.tree_albums.selection()[0])
+        self.tree_albums.focus_set()
+        return "break"
+
+    def _kb_album_left(self, event):
+        """专辑列按左：取消专辑+歌曲高亮，焦点回到歌手列。
+           ★ 保留专辑/歌曲列展开；保留歌手原有高亮（若无选中则自动选中第一位）。"""
+        if not self._in_library():
+            return self._on_key_press(event)
+        self.tree_albums.selection_remove(self.tree_albums.selection())
+        self.tree_tracks.selection_remove(self.tree_tracks.selection())
+        if not self.tree_artists.selection():
+            artist_children = self.tree_artists.get_children()
+            if artist_children:
+                self.tree_artists.selection_set(artist_children[0])
+                self.tree_artists.focus(artist_children[0])
+        else:
+            self.tree_artists.focus(self.tree_artists.selection()[0])
+        self.tree_artists.focus_set()
+        return "break"
+
+    def _kb_escape(self, event):
+        """ESC：收起所有下级列，清空专辑/歌曲高亮，焦点与高亮回到歌手列"""
+        if not self._in_library():
+            return "break"  # 播放中标签页按 ESC 无操作
+        self.tree_albums.selection_remove(self.tree_albums.selection())
+        self.tree_tracks.selection_remove(self.tree_tracks.selection())
+        self._set_headers("artists")
+        if not self.tree_artists.selection():
+            artist_children = self.tree_artists.get_children()
+            if artist_children:
+                self.tree_artists.selection_set(artist_children[0])
+                self.tree_artists.focus(artist_children[0])
+        else:
+            self.tree_artists.focus(self.tree_artists.selection()[0])
+        self.tree_artists.focus_set()
+        return "break"
+
+    def _kb_track_right(self, event):
+        """歌曲列按右：不播放，防止误触"""
+        if not self._in_library():
+            return self._on_key_press(event)
+        return "break"
+
+    def _kb_track_play(self, event):
+        """歌曲列按回车：播放当前歌曲"""
+        if not self._in_library():
+            return self._on_key_press(event)
+        children = self.tree_tracks.get_children()
+        if not children:
+            return "break"
+            
+        sel = self.tree_tracks.selection()
+        if not sel:
+            self.tree_tracks.selection_set(children[0])
+            self.tree_tracks.focus(children[0])
+            sel = self.tree_tracks.selection()
+            
+        if sel:
+            info = self._lib_tracks.get(sel[0])
+            if info:
+                tid, tname = info
+                self.lms.play_track(tid)
+                self._lib_set_status(f"正在播放: {tname}")
+        return "break"
 
     # ================= 样式 =================
     def _build_style(self):
@@ -288,7 +606,6 @@ class ControlPanel:
         except tk.TclError:
             pass
         
-        # ★ 去掉 Notebook 的焦点虚线框（蚂蚁线）
         style.layout("TNotebook.Tab", [
             ("Notebook.tab", {"sticky": "nswe", "children": [
                 ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
@@ -344,9 +661,16 @@ class ControlPanel:
                         background=self.FIELD, foreground=self.FG,
                         fieldbackground=self.FIELD, rowheight=26,
                         borderwidth=0, relief="flat")
+
+        # ★ 加深选中背景色：深色模式用紫蓝强调色，浅色模式用深蓝强调色，文字纯白
+        # ★ 新增 !focus selected：即使焦点离开某棵树，该树内已选中项依然保持高亮
+        _sel_bg = "#5A5AE0" if self.cfg.DARK_MODE else "#4A4AE0"
         style.map("Library.Treeview",
-                  background=[("selected", self.SEL_BG)],
-                  foreground=[("selected", "#FFFFFF" if self.cfg.DARK_MODE else "#1A1A24")])
+                  background=[("selected", _sel_bg),
+                              ("!focus selected", _sel_bg)],
+                  foreground=[("selected", "#FFFFFF"),
+                              ("!focus selected", "#FFFFFF")])
+
         style.layout("Library.Treeview", [
             ("Library.Treeview.treearea", {"sticky": "nswe"})
         ])
@@ -383,6 +707,9 @@ class ControlPanel:
         nb = ttk.Notebook(p)
         nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.nb = nb
+        # ★ 在 widget 层提前拦截方向键，避免被 ttk.Notebook 的 class bind 抢先切标签
+        nb.bind("<Left>", self._on_key_press)
+        nb.bind("<Right>", self._on_key_press)
 
         btn_group = tk.Frame(nb, bg=self.BG)
         btn_group.place(relx=1.0, x=-8, y=10, anchor="ne")
@@ -393,13 +720,13 @@ class ControlPanel:
         self.btn_settings.pack(side="left", padx=(0, 6))
 
         self.btn_lyrics = self._make_round_btn(
-            btn_group, "● 桌面歌词", self._toggle_lyrics,
-            width=80, height=22, radius=8)
+            btn_group, "● 歌词", self._toggle_lyrics,
+            width=64, height=22, radius=8)
         self.btn_lyrics.pack(side="left", padx=(0, 6))
 
         self.btn_shutdown = self._make_round_btn(
-            btn_group, "⏻ 关闭达菲", self._shutdown_daphile,
-            width=80, height=22, radius=8)
+            btn_group, "⏻ 达菲", self._shutdown_daphile,
+            width=64, height=22, radius=8)
         self.btn_shutdown.pack(side="left")
 
         # ================= TAB 1：正在播放 =================
@@ -456,10 +783,15 @@ class ControlPanel:
             diameter=38, font_size=10, primary=False)
         self.btn_next.pack(side="left", padx=8)
 
+        # ★ 音量控制行：喇叭图标 + 百分比 + 滑块
         vol_row = tk.Frame(f1, bg=self.BG)
         vol_row.pack(fill="x", pady=(0, 10))
-        tk.Label(vol_row, text="音量", bg=self.BG, fg=self.DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(vol_row, text="🔊", bg=self.BG, fg=self.DIM,
+                 font=("Segoe UI Emoji", 12)).pack(side="left")
+        self.lbl_vol_pct = tk.Label(
+            vol_row, text="50%", bg=self.BG, fg=self.DIM,
+            font=("Consolas", 9), width=4, anchor="w")
+        self.lbl_vol_pct.pack(side="left", padx=(4, 2))
         self.scl_vol = CanvasSlider(
             vol_row, from_=0, to=100, value=50,
             bg=self.BG, trough="#0F0F16" if self.cfg.DARK_MODE else "#E0E0E8",
@@ -468,7 +800,7 @@ class ControlPanel:
             command=self._on_volume,
             on_drag_start=self._on_vol_drag_start,
             on_drag_end=self._on_vol_drag_end)
-        self.scl_vol.pack(side="left", fill="x", expand=True, padx=8)
+        self.scl_vol.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         # ---- 歌词外观（默认隐藏） ----
         self.ap_container = tk.Frame(f1, bg=self.BG)
@@ -518,6 +850,44 @@ class ControlPanel:
         self._theme_toggle.pack(side="left", padx=(0, 6))
         tk.Label(about_row, text="深色模式", bg=self.BG, fg=self.DIM,
                  font=("Microsoft YaHei UI", 9)).pack(side="left")
+
+        # ★ 播放调整（左右键 seek，秒）
+        tk.Label(about_row, text="播放调整", bg=self.BG, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(12, 2))
+        self.spn_seek_step = tk.Spinbox(
+            about_row, from_=1, to=60, width=3, justify="center",
+            bg=self.FIELD, fg=self.FG, relief="flat",
+            buttonbackground=self.CARD, insertbackground=self.FG,
+            font=("Microsoft YaHei UI", 9),
+            command=self._on_seek_step_change)
+        self.spn_seek_step.pack(side="left")
+        self.spn_seek_step.delete(0, "end")
+        self.spn_seek_step.insert(0, str(int(getattr(self.cfg, "SEEK_STEP", 5))))
+        self.spn_seek_step.bind("<KeyRelease>", self._on_seek_step_change)
+        self.spn_seek_step.bind("<FocusOut>", self._on_seek_step_change)
+        self.spn_seek_step.bind("<Return>", self._commit_spinbox)
+        self.spn_seek_step.bind("<Escape>", self._commit_spinbox)
+        tk.Label(about_row, text="秒", bg=self.BG, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(2, 0))
+
+        # ★ 音量调整（上下键调节，%）
+        tk.Label(about_row, text="音量调整", bg=self.BG, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(10, 2))
+        self.spn_vol_step = tk.Spinbox(
+            about_row, from_=1, to=50, width=3, justify="center",
+            bg=self.FIELD, fg=self.FG, relief="flat",
+            buttonbackground=self.CARD, insertbackground=self.FG,
+            font=("Microsoft YaHei UI", 9),
+            command=self._on_vol_step_change)
+        self.spn_vol_step.pack(side="left")
+        self.spn_vol_step.delete(0, "end")
+        self.spn_vol_step.insert(0, str(int(getattr(self.cfg, "VOL_STEP", 5))))
+        self.spn_vol_step.bind("<KeyRelease>", self._on_vol_step_change)
+        self.spn_vol_step.bind("<FocusOut>", self._on_vol_step_change)
+        self.spn_vol_step.bind("<Return>", self._commit_spinbox)
+        self.spn_vol_step.bind("<Escape>", self._commit_spinbox)
+        tk.Label(about_row, text="%", bg=self.BG, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(2, 0))
 
         self.btn_about = self._make_round_btn(
             about_row, "ⓘ 关于", self._show_about,
@@ -583,6 +953,25 @@ class ControlPanel:
         self.tree_artists.bind("<<TreeviewSelect>>", self._on_artist_selected)
         self.tree_albums.bind("<<TreeviewSelect>>", self._on_album_selected)
         self.tree_tracks.bind("<Double-1>", self._on_track_activate)
+
+        # ★ 绑定左右与回车键
+        self.tree_artists.bind("<Right>", self._kb_artist_right)
+        self.tree_artists.bind("<Return>", self._kb_artist_right)
+        self.tree_artists.bind("<Left>", self._kb_artist_left)
+        self.tree_artists.bind("<Down>", self._kb_artist_down)
+        
+        self.tree_albums.bind("<Left>", self._kb_album_left)
+        self.tree_albums.bind("<Right>", self._kb_album_right)
+        self.tree_albums.bind("<Return>", self._kb_album_right)
+
+        self.tree_tracks.bind("<Left>", self._kb_track_left)
+        self.tree_tracks.bind("<Right>", self._kb_track_right)  # 右键不播放
+        self.tree_tracks.bind("<Return>", self._kb_track_play)  # 回车播放
+
+        # ★ ESC：收起所有下级列，清空专辑/歌曲高亮，回歌手列
+        self.tree_artists.bind("<Escape>", self._kb_escape)
+        self.tree_albums.bind("<Escape>", self._kb_escape)
+        self.tree_tracks.bind("<Escape>", self._kb_escape)
 
         bot = tk.Frame(f2, bg=self.BG)
         bot.pack(fill="x", pady=(6, 0))
@@ -653,14 +1042,24 @@ class ControlPanel:
 
         self._update_custom_widgets(self.panel)
         self._lib_refresh()
-        # ★ 强制更新特定控件的颜色（修复颜色映射冲突导致的背景/文字异常）
+        
         try:
-            # 1. 字号输入框和搜索框（背景用 FIELD，文字用 FG）
             self.spn_size.config(
                 bg=self.FIELD, fg=self.FG, 
                 buttonbackground=self.CARD, 
                 insertbackground=self.FG
             )
+            try:
+                self.spn_seek_step.config(
+                    bg=self.FIELD, fg=self.FG,
+                    buttonbackground=self.CARD,
+                    insertbackground=self.FG)
+                self.spn_vol_step.config(
+                    bg=self.FIELD, fg=self.FG,
+                    buttonbackground=self.CARD,
+                    insertbackground=self.FG)
+            except (AttributeError, tk.TclError):
+                pass            
             self.ent_search.config(
                 bg=self.FIELD, fg=self.FG, 
                 insertbackground=self.FG,
@@ -668,7 +1067,6 @@ class ControlPanel:
                 highlightcolor=self.ACCENT
             )
             
-            # 2. 所有标签（确保它们的底色和文字对比正确）
             self.lbl_title.config(bg=self.CARD, fg=self.FG)
             self.lbl_artist.config(bg=self.CARD, fg=self.DIM)
             self.lbl_time.config(bg=self.BG, fg=self.DIM)
@@ -714,6 +1112,10 @@ class ControlPanel:
             traceback.print_exc()
 
     def _toggle_play(self):
+        now = time.time()
+        if now - self._last_play_press < 0.5:
+            return
+        self._last_play_press = now
         try:
             self.lms.command(["pause"])
         except Exception:
@@ -723,11 +1125,11 @@ class ControlPanel:
         try:
             if self.overlay.is_visible():
                 self.overlay.hide()
-                self.btn_lyrics.set_text("○ 桌面歌词")
+                self.btn_lyrics.set_text("○ 歌词")
                 self.cfg.OVERLAY_VISIBLE = False
             else:
                 self.overlay.show()
-                self.btn_lyrics.set_text("● 桌面歌词")
+                self.btn_lyrics.set_text("● 歌词")
                 self.cfg.OVERLAY_VISIBLE = True
             self.cfg.save()
         except Exception:
@@ -745,6 +1147,12 @@ class ControlPanel:
         if cur == 0:
             self.btn_settings.pack_forget()
             self.btn_settings.pack(side="left", padx=(0, 6), before=self.btn_lyrics)
+            # ★ 切回播放中时主动把焦点移出树/Notebook，
+            #   之后按方向键都会走到 _on_key_press
+            try:
+                self.panel.focus_set()
+            except tk.TclError:
+                pass        
         else:
             self.btn_settings.pack_forget()
             if not self.tree_artists.get_children():
@@ -772,11 +1180,22 @@ class ControlPanel:
         except tk.TclError:
             pass
 
+    def _set_vol_pct(self, v):
+        """更新音量百分比标签（容错：标签可能尚未构建或被销毁）"""
+        try:
+            pct = max(0, min(100, int(round(float(v)))))
+            self.lbl_vol_pct.config(text=f"{pct}%")
+        except (tk.TclError, ValueError, TypeError, AttributeError):
+            pass
+
     def _on_volume(self, val):
         try:
-            self.lms.command(["mixer", "volume", str(int(float(val)))])
+            v = int(float(val))
+            self.lms.command(["mixer", "volume", str(v)])
         except Exception:
-            pass
+            v = None
+        if v is not None:
+            self._set_vol_pct(v)
 
     def _on_vol_drag_start(self):
         self._vol_dragging = True
@@ -797,8 +1216,15 @@ class ControlPanel:
         try:
             pos = float(self.progress.get())
             if self._duration:
-                self.lms.seek(pos)
                 self.song_pos = pos
+                self._last_seek_ts = time.time()
+
+                def work(p=pos):
+                    try:
+                        self.lms.seek(p)
+                    except Exception:
+                        traceback.print_exc()
+                threading.Thread(target=work, daemon=True).start()
         except Exception:
             traceback.print_exc()
 
@@ -830,8 +1256,54 @@ class ControlPanel:
         self.cfg.FONT_FAMILY = fam
         self.cfg.FONT_SIZE = max(12, min(72, size))
         self.cfg.save()
-        self.overlay.set_line(self._line_text(), self._next_text(),
-                              self.track_info.get("title", ""))
+        
+        main, trans, next_t, _ = self._get_current_texts()
+        self.overlay.set_line(main, next_t, self.track_info.get("title", ""), trans)
+
+    def _on_seek_step_change(self, _e=None):
+        """读取进度步进 Spinbox 并持久化；非法值在失焦时自动恢复"""
+        txt = self.spn_seek_step.get().strip()
+        try:
+            val = int(float(txt))
+            if 1 <= val <= 60:
+                self.cfg.SEEK_STEP = val
+                try:
+                    self.cfg.save()
+                except Exception:
+                    pass
+                return
+        except (ValueError, tk.TclError):
+            pass
+        # 非法值：失焦时自动恢复为当前配置
+        try:
+            if self.panel.focus_get() != self.spn_seek_step:
+                self.spn_seek_step.delete(0, "end")
+                self.spn_seek_step.insert(
+                    0, str(int(getattr(self.cfg, "SEEK_STEP", 5))))
+        except tk.TclError:
+            pass
+
+    def _on_vol_step_change(self, _e=None):
+        """读取音量步进 Spinbox 并持久化；非法值在失焦时自动恢复"""
+        txt = self.spn_vol_step.get().strip()
+        try:
+            val = int(float(txt))
+            if 1 <= val <= 50:
+                self.cfg.VOL_STEP = val
+                try:
+                    self.cfg.save()
+                except Exception:
+                    pass
+                return
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            if self.panel.focus_get() != self.spn_vol_step:
+                self.spn_vol_step.delete(0, "end")
+                self.spn_vol_step.insert(
+                    0, str(int(getattr(self.cfg, "VOL_STEP", 5))))
+        except tk.TclError:
+            pass
 
     def _pick_color(self, key):
         current = getattr(self.cfg, key)
@@ -848,8 +1320,9 @@ class ControlPanel:
             sw = swatch_map.get(key)
             if sw:
                 sw()
-            self.overlay.set_line(self._line_text(), self._next_text(),
-                                  self.track_info.get("title", ""))
+            
+            main, trans, next_t, _ = self._get_current_texts()
+            self.overlay.set_line(main, next_t, self.track_info.get("title", ""), trans)
 
     # ================= 关于 / 更新 =================
     def _open_url(self, url):
@@ -930,6 +1403,7 @@ class ControlPanel:
         self._cover_photo = None
         self.lines = []
         self.cur_line_idx = -1
+        self._last_idx = -1
         self._lyrics_source = ""
         self.track_info = {}
         self._vol_set = False
@@ -1110,14 +1584,27 @@ class ControlPanel:
         while not self._stop:
             try:
                 st = self.lms.get_status()
-                self.song_pos = st.get("time", 0.0)
+                in_grace = (time.time() - self._last_seek_ts) <= 1.5
+
+                # seek 保护期：不用 LMS 旧值覆写 song_pos，避免进度条弹回
+                if not in_grace:
+                    self.song_pos = st.get("time", 0.0)
                 self._duration = st.get("duration", 0.0)
-                self._playing = st.get("mode") == "play"
+
+                # seek 保护期：如果本地是暂停态，忽略 LMS 瞬时的 "play" 通知，
+                # 避免播放/暂停按钮闪烁、避免误判为已播放
+                new_playing = st.get("mode") == "play"
+                if in_grace and (not self._playing) and new_playing:
+                    pass  # 保持暂停显示
+                else:
+                    self._playing = new_playing
                 if "volume" in st and not self._vol_dragging:
                     try:
                         v = float(st["volume"])
                         if abs(v - float(self.scl_vol.get())) > 0.5:
                             self.scl_vol.set(v)
+                        # ★ 后台线程更新 UI 走 after
+                        self.panel.after(0, lambda vv=v: self._set_vol_pct(vv))
                     except (TypeError, ValueError):
                         pass
                 tid = st.get("track_id")
@@ -1143,6 +1630,7 @@ class ControlPanel:
     def _start_fetch(self, st):
         self.lines = []
         self.cur_line_idx = -1
+        self._last_idx = -1
         self._lyrics_source = ""
         token = self._fetch_token = self._fetch_token + 1
         track_id = st.get("track_id")
@@ -1167,6 +1655,7 @@ class ControlPanel:
                     self.lines = []
                     self._lyrics_source = "未找到"
                 self.cur_line_idx = -1
+                self._last_idx = -1
             self.panel.after(0, apply)
 
         threading.Thread(target=work, daemon=True).start()
@@ -1253,7 +1742,7 @@ class ControlPanel:
                         print(f"[封面] 命中: {url} ({len(data)} bytes)")
                         self.panel.after(0, lambda d=data, k=key: self._on_cover_downloaded(k, d))
                         return
-                except Exception as e:
+                except Exception:
                     pass
             print(f"[封面] 全部 URL 失败 key={key}")
 
@@ -1285,6 +1774,35 @@ class ControlPanel:
             traceback.print_exc()
         self.panel.after(100, self._ui_tick_loop)
 
+    def _get_current_texts(self):
+        """提取当前的主行、翻译行、下一句以及该句的结束时间"""
+        if not self.lines or self.cur_line_idx < 0 or self.cur_line_idx >= len(self.lines):
+            return "", "", "", 0.0
+        
+        idx = self.cur_line_idx
+        t0 = self.lines[idx][0]
+        
+        current_lines = [self.lines[idx][1]]
+        
+        # ★ 向下查找：严格容差（< 0.6 秒）内才判定为翻译行
+        j = idx + 1
+        while j < len(self.lines):
+            t_next = self.lines[j][0]
+            if t_next - t0 < 0.6 and self.lines[j][1] not in current_lines:
+                current_lines.append(self.lines[j][1])
+                j += 1
+            else:
+                break
+                
+        main_text = current_lines[0]
+        trans_text = current_lines[1] if len(current_lines) > 1 else ""
+        next_text = self.lines[j][1] if j < len(self.lines) else ""
+        
+        # 计算结束时间
+        t1 = self.lines[j][0] if j < len(self.lines) else t0 + max(3.0, len(main_text) * 0.28)
+        
+        return main_text, trans_text, next_text, t1
+
     def _ui_tick(self):
         info = self.track_info
         title = info.get("title", "") or "—"
@@ -1303,18 +1821,27 @@ class ControlPanel:
 
         if self.lines:
             idx = LrcParser.find_current(self.lines, self.song_pos)
-            if idx != self.cur_line_idx:
-                self.cur_line_idx = idx
-                self.overlay.set_line(self._line_text(), self._next_text(), info.get("title", ""))
-            if 0 <= idx < len(self.lines):
-                t0 = self.lines[idx][0]
-                j = idx + 1
-                while j < len(self.lines) and self.lines[j][0] == t0:
-                    j += 1
-                if j < len(self.lines): t1 = self.lines[j][0]
-                else: t1 = t0 + max(3.0, len(self.lines[idx][1]) * 0.28)
+            
+            # ★ 向上回溯，锁定主行，严格容差（< 0.6 秒）
+            main_idx = idx
+            if idx > 0:
+                t_prev = self.lines[idx - 1][0]
+                t_curr = self.lines[idx][0]
+                if t_curr - t_prev < 0.6 and self.lines[idx-1][1] != self.lines[idx][1]:
+                    main_idx = idx - 1
+
+            if idx != self._last_idx:
+                self._last_idx = idx
+                self.cur_line_idx = main_idx
+                main, trans, next_t, _ = self._get_current_texts()
+                self.overlay.set_line(main, next_t, info.get("title", ""), trans)
+            
+            if 0 <= main_idx < len(self.lines):
+                main, trans, next_t, t1 = self._get_current_texts()
+                t0 = self.lines[main_idx][0]
                 span = max(t1 - t0, 0.3)
                 self.overlay.set_progress((self.song_pos - t0) / span)
+                
         elif self._lyrics_source == "未找到":
             self.overlay.clear(info.get("title", ""), message=f"暂无歌词：{info.get('title', '')}")
         else:
@@ -1323,7 +1850,7 @@ class ControlPanel:
 
         try:
             vis = self.overlay.is_visible()
-            self.btn_lyrics.set_text("● 桌面歌词" if vis else "○ 桌面歌词")
+            self.btn_lyrics.set_text("● 歌词" if vis else "○ 歌词")
             if self._last_overlay_vis is None:
                 self._last_overlay_vis = vis
             elif self._last_overlay_vis != vis:
@@ -1480,7 +2007,16 @@ class ControlPanel:
             iid = f"al{alid}"
             self.tree_albums.insert("", "end", iid=iid, text=alname, image=self._make_icon("album"))
             self._lib_albums[iid] = (str(alid), alname)
+            
         self._lib_set_status(f"{artist_name} · {len(albums)} 张专辑 · 单击查看歌曲")
+
+        if getattr(self, "_kb_focus_albums", False):
+            self._kb_focus_albums = False
+            if albums:
+                self.tree_albums.selection_set(self.tree_albums.get_children()[0])
+                self.tree_albums.focus(self.tree_albums.get_children()[0])
+                self._kb_select_tracks = False
+                self._on_album_selected()
 
     def _lib_load_tracks(self, album_id, album_name):
         self._lib_clear_tracks()
@@ -1507,7 +2043,15 @@ class ControlPanel:
             label = f"{tno}. {tname}" if tno else tname
             self.tree_tracks.insert("", "end", iid=iid, text=label)
             self._lib_tracks[iid] = (str(tid), tname)
+            
         self._lib_set_status(f"{album_name} · {len(tracks)} 首 · 双击播放")
+
+        if getattr(self, "_kb_select_tracks", False):
+            self._kb_select_tracks = False
+            if tracks:
+                self.tree_tracks.selection_set(self.tree_tracks.get_children()[0])
+                self.tree_tracks.focus(self.tree_tracks.get_children()[0])
+                self.tree_tracks.focus_set()
 
     def _on_artist_selected(self, _e=None):
         sel = self.tree_artists.selection()
@@ -1708,7 +2252,7 @@ class ControlPanel:
             if not ok:
                 def fail():
                     self._lib_set_status("关机指令发送失败，请检查网络")
-                    self.btn_shutdown.set_text("⏻ 关闭达菲")
+                    self.btn_shutdown.set_text("⏻ 达菲")
                     self.btn_shutdown.set_state(True)
                 self.panel.after(0, fail)
                 return
@@ -1727,7 +2271,7 @@ class ControlPanel:
                     self.panel.after(500, self._after_shutdown)
                 else:
                     self._lib_set_status("等待超时，设备可能仍在运行，请手动确认")
-                    self.btn_shutdown.set_text("⏻ 关闭达菲")
+                    self.btn_shutdown.set_text("⏻ 达菲")
                     self.btn_shutdown.set_state(True)
             self.panel.after(0, apply)
 
@@ -1751,11 +2295,12 @@ class ControlPanel:
         self._cover_photo = None
         self.lines = []
         self.cur_line_idx = -1
+        self._last_idx = -1
         self._lyrics_source = ""
         self.track_info = {}
 
         try:
-            self.btn_shutdown.set_text("⏻ 关闭达菲")
+            self.btn_shutdown.set_text("⏻ 达菲")
             self.btn_shutdown.set_state(True)
         except Exception:
             pass
@@ -1769,10 +2314,10 @@ class ControlPanel:
         try:
             if getattr(self.cfg, "OVERLAY_VISIBLE", True):
                 self.overlay.show()
-                self.btn_lyrics.set_text("● 桌面歌词")
+                self.btn_lyrics.set_text("● 歌词")
             else:
                 self.overlay.hide()
-                self.btn_lyrics.set_text("○ 桌面歌词")
+                self.btn_lyrics.set_text("○ 歌词")
         except Exception:
             pass
     
