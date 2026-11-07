@@ -281,7 +281,51 @@ class LmsClient:
                            player="-")
         return [(t.get("id"), t.get("tracknum", 0), t.get("title", ""))
                 for t in res.get("titles_loop", [])]
+   
+    def browse_new_albums(self, limit=60):
+        """获取最新加入音乐库的专辑（LMS 的 New Music）。
+           返回 [(album_id, album_name, artist_name, coverid), ...]，最新在前。
+           优先请求 alK（album+artist+coverid）；K 不可用时退到 al，
+           封面再用首曲 track_id 兜底（由 UI 层负责）。"""
+        results = []
+        seen = set()
 
+        def _collect(loop):
+            for a in loop or []:
+                aid = str(a.get("id") or "")
+                name = a.get("album") or a.get("title", "") or ""
+                artist = a.get("artist", "") or ""
+                # K → coverid；兼容 cover 字段
+                coverid = str(a.get("coverid") or a.get("cover") or "")
+                if aid and aid not in seen:
+                    seen.add(aid)
+                    results.append((aid, name, artist, coverid))
+
+        # ① sort:new + alK（新音乐排序 + 封面 ID）
+        for tags in ("alK", "al"):
+            try:
+                res = self.command(
+                    ["albums", 0, limit, f"tags:{tags}", "sort:new"],
+                    player="-")
+                _collect(res.get("albums_loop"))
+                if results:
+                    return results
+            except Exception as e:
+                print(f"[新歌曲] albums tags:{tags} sort:new 失败: {e}")
+
+        # ② 兜底：无 sort:new 时用普通专辑列表
+        for tags in ("alK", "al"):
+            try:
+                res = self.command(
+                    ["albums", 0, limit, f"tags:{tags}"], player="-")
+                _collect(res.get("albums_loop"))
+                if results:
+                    break
+            except Exception as e:
+                print(f"[新歌曲] albums tags:{tags} 兜底失败: {e}")
+
+        return results
+    
     def search(self, query):
         """搜索：返回 {tracks, artists, albums} 字典。
            · tracks: [(id, tracknum, title, artist, album, album_id), ...] 6 元组

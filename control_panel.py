@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import threading
+import queue
 import time
 import traceback
 import urllib.request
@@ -22,7 +23,7 @@ except ImportError:
     HAS_PIL = False
 
 
-APP_VERSION = "v5.0.0"
+APP_VERSION = "v6.0.0"
 APP_REPO = "songshuxiao/Daphile-Player"
 GITHUB_URL = f"https://github.com/{APP_REPO}"
 RELEASES_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
@@ -256,6 +257,19 @@ class ControlPanel:
         self._lib_artist_token = 0
         self._lib_album_token = 0
         self._lib_track_token = 0
+       
+        # —— 新歌曲 Tab ——
+        self._ns_albums = []
+        self._ns_tracks = {}
+        self._ns_loaded = False
+        self._ns_view = "grid"          # "grid" / "list"
+        self._ns_current_album = None   # (album_id, album_name, artist, coverid)
+        self._ns_cover_cache = {}       # 网格封面缓存
+        self._ns_album_cover_cache = {} # 底部大图缓存
+        self._ns_cover_size = 132
+        self._ns_cover_queue = queue.Queue()
+        self._ns_first_track_cache = {}   # album_id -> (coverid, track_id)
+        self._ns_grid_panel_h = None      # 网格模式下面板高度缓存        
 
         # 键盘导航标志位
         self._kb_focus_albums = False
@@ -299,20 +313,24 @@ class ControlPanel:
         if isinstance(w, (tk.Entry, ttk.Entry, tk.Spinbox, ttk.Combobox, tk.Text)):
             return None
 
-        # Tab 切换标签页
+        # Tab 循环切换 播放中 → 音乐库 → 新歌曲 → 播放中
         if event.keysym == "Tab":
             cur = self.nb.index(self.nb.select())
-            new_tab = 1 if cur == 0 else 0
+            new_tab = (cur + 1) % 3
             self.nb.select(new_tab)
             if new_tab == 1:
-                # 切到音乐库：焦点还给用户最后操作的那一列
                 try:
                     self.panel.update_idletasks()
                     self._focus_library_tree()
                 except tk.TclError:
                     pass
+            elif new_tab == 2:
+                try:
+                    self._ns_ensure_loaded()
+                    self.f3.focus_set()
+                except tk.TclError:
+                    pass
             else:
-                # 切回播放中：把焦点从树移开，避免残留焦点干扰方向键
                 try:
                     self.panel.focus_set()
                 except tk.TclError:
@@ -676,6 +694,20 @@ class ControlPanel:
         ])
         style.configure("Library.Treeview.Heading", background=self.CARD,
                         foreground=self.DIM, relief="flat", borderwidth=0)
+        # 新歌曲页滚动条：细、无槽边、颜色随主题
+        style.configure("NewSongs.Vertical.TScrollbar",
+                        gripcount=0,
+                        background=self.SEL_BG,
+                        darkcolor=self.SEL_BG,
+                        lightcolor=self.SEL_BG,
+                        troughcolor=self.BG,
+                        bordercolor=self.BG,
+                        arrowcolor=self.DIM,
+                        width=10)
+        style.map("NewSongs.Vertical.TScrollbar",
+                  background=[("active", self.ACCENT),
+                              ("pressed", self.ACCENT)],
+                  arrowcolor=[("active", self.FG)])        
 
     # ================= UI 构建 =================
     def _build_ui(self):
@@ -979,6 +1011,120 @@ class ControlPanel:
                                 font=("Microsoft YaHei UI", 9))
         self.lbl_lib.pack(side="left", padx=0)
 
+        # ================= TAB 3：新歌曲 =================
+        f3 = ttk.Frame(nb, padding=10)
+        nb.add(f3, text="新歌曲")
+        self.f3 = f3
+
+        ns_top = tk.Frame(f3, bg=self.BG)
+        ns_top.pack(fill="x", pady=(0, 6))
+
+        self.lbl_ns_title = tk.Label(ns_top, text="最新专辑", bg=self.BG,
+                                     fg=self.DIM,
+                                     font=("Microsoft YaHei UI", 9), anchor="w")
+        self.lbl_ns_title.pack(side="left", padx=(4, 0))
+
+        self.btn_ns_back = self._make_back_button(ns_top, self._ns_back_to_grid)
+
+        self.btn_ns_refresh = self._mk_btn(ns_top, "↻", self._ns_refresh)
+        self.btn_ns_refresh.pack(side="right")
+
+        # --- 网格视图（可滚动，3 列不限行） ---
+        self.ns_grid_wrap = tk.Frame(f3, bg=self.BG)
+        self.ns_grid_wrap.pack(fill="both", expand=True)
+
+        self.ns_canvas = tk.Canvas(self.ns_grid_wrap, bg=self.BG,
+                                   highlightthickness=0, bd=0)
+        _ns_vsb = ttk.Scrollbar(self.ns_grid_wrap, orient="vertical",
+                                command=self.ns_canvas.yview,
+                                style="NewSongs.Vertical.TScrollbar")
+        self.ns_canvas.configure(yscrollcommand=_ns_vsb.set)
+        _ns_vsb.pack(side="right", fill="y", padx=(2, 0))
+        self.ns_canvas.pack(side="left", fill="both", expand=True)
+
+        self.ns_inner = tk.Frame(self.ns_canvas, bg=self.BG)
+        self._ns_win = self.ns_canvas.create_window(
+            (0, 0), window=self.ns_inner, anchor="nw")
+
+        def _ns_inner_cfg(_e=None):
+            try:
+                self.ns_canvas.configure(
+                    scrollregion=self.ns_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        def _ns_canvas_cfg(e):
+            try:
+                self.ns_canvas.itemconfig(self._ns_win, width=e.width)
+            except tk.TclError:
+                pass
+
+        self.ns_inner.bind("<Configure>", _ns_inner_cfg)
+        self.ns_canvas.bind("<Configure>", _ns_canvas_cfg)
+        self.ns_canvas.bind("<MouseWheel>", self._ns_on_wheel)
+        self.ns_inner.bind("<MouseWheel>", self._ns_on_wheel)
+
+        # --- 专辑歌曲列表视图 ---
+        self.ns_list_wrap = tk.Frame(f3, bg=self.BG)
+
+        # 底部信息栏（高度随内容自适应）
+        self.ns_bottom_bar = tk.Frame(self.ns_list_wrap, bg=self.CARD)
+        self.ns_bottom_bar.pack(side="bottom", fill="x", pady=(8, 0))
+
+        # ① 先打包右侧，锁定其宽度，避免被中间区域挤压
+        self.ns_right = tk.Frame(self.ns_bottom_bar, bg=self.CARD)
+        self.ns_right.pack(side="right", padx=(12, 12), pady=12, fill="y")
+        self.lbl_ns_album = tk.Label(self.ns_right, text="", bg=self.CARD,
+                                     fg=self.ACCENT,
+                                     font=("Microsoft YaHei UI", 18, "bold"),
+                                     anchor="e", justify="right")
+        self.lbl_ns_album.pack(fill="x", anchor="e")
+        self.lbl_ns_artist = tk.Label(self.ns_right, text="", bg=self.CARD,
+                                      fg=self.DIM,
+                                      font=("Microsoft YaHei UI", 9),
+                                      anchor="e", justify="right", wraplength=170)
+        self.lbl_ns_artist.pack(fill="x", anchor="e")
+
+        # ② 再打包左侧封面
+        self.ns_album_cover = tk.Canvas(self.ns_bottom_bar, width=72, height=72,
+                                        bg=self.CARD, highlightthickness=0, bd=0)
+        self.ns_album_cover.pack(side="left", padx=(10, 12), pady=10)
+
+        # ③ 最后打包中间：expand 填满剩余，长歌名只会压缩自身，不再挤右侧
+        self.ns_center = tk.Frame(self.ns_bottom_bar, bg=self.CARD)
+        self.ns_center.pack(side="left", fill="both", expand=True, pady=12)
+        tk.Label(self.ns_center, text="正在播放", bg=self.CARD, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 8), anchor="w").pack(
+            side="top", fill="x")
+        self.lbl_ns_now = tk.Label(self.ns_center, text="—", bg=self.CARD,
+                                   fg=self.ACCENT,
+                                   font=("Microsoft YaHei UI", 11, "bold"),
+                                   anchor="w", justify="left")
+        self.lbl_ns_now.pack(side="bottom", fill="x", anchor="w")
+
+        # 列表区（最后 pack 占满剩余空间）
+        self.ns_tree_frame = tk.Frame(self.ns_list_wrap, bg=self.BG)
+        self.ns_tree_frame.pack(fill="both", expand=True)
+
+        self.ns_tree = ttk.Treeview(self.ns_tree_frame, show="tree",
+                                    selectmode="browse",
+                                    style="Library.Treeview", height=4)
+        _ns_tree_vsb = ttk.Scrollbar(self.ns_tree_frame, orient="vertical",
+                                     command=self.ns_tree.yview,
+                                     style="NewSongs.Vertical.TScrollbar")
+        self.ns_tree.configure(yscrollcommand=_ns_tree_vsb.set)
+        _ns_tree_vsb.pack(side="right", fill="y", padx=(2, 0))
+        self.ns_tree.pack(side="left", fill="both", expand=True)
+
+        self.ns_tree.bind("<Double-1>", self._on_ns_track_activate)
+        self.ns_tree.bind("<Return>", self._on_ns_track_activate)
+        self.ns_tree.bind("<Escape>", self._ns_on_escape)
+
+        # 网格封面下载线程池
+        for _ in range(4):
+            threading.Thread(target=self._ns_cover_worker,
+                             daemon=True).start()     
+            
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_tree_column(self, parent):
@@ -1039,6 +1185,8 @@ class ControlPanel:
         if hasattr(self, "_toggle_cache"): self._toggle_cache.clear()
         if hasattr(self, "_circle_cache"): self._circle_cache.clear()
         self._icon_cache.clear()
+        if hasattr(self, "_back_icon_cache"): self._back_icon_cache.clear()
+        self._ns_grid_panel_h = None
 
         self._update_custom_widgets(self.panel)
         self._lib_refresh()
@@ -1136,6 +1284,12 @@ class ControlPanel:
             traceback.print_exc()
 
     def _calc_panel_height(self):
+        try:
+            cur = self.nb.index(self.nb.select())
+        except Exception:
+            cur = 0
+        if cur == 2:
+            return 480 if self._ns_view == "list" else 720
         return 490 if self._lyrics_appearance_visible else 365
 
     def _on_tab_changed(self, _e=None):
@@ -1145,19 +1299,32 @@ class ControlPanel:
             return
 
         if cur == 0:
+            # 播放中：显示「⚙ 设置」按钮
             self.btn_settings.pack_forget()
-            self.btn_settings.pack(side="left", padx=(0, 6), before=self.btn_lyrics)
-            # ★ 切回播放中时主动把焦点移出树/Notebook，
-            #   之后按方向键都会走到 _on_key_press
+            self.btn_settings.pack(side="left", padx=(0, 6),
+                                   before=self.btn_lyrics)
             try:
                 self.panel.focus_set()
             except tk.TclError:
-                pass        
-        else:
+                pass
+
+        elif cur == 1:
+            # 音乐库：隐藏「⚙ 设置」
             self.btn_settings.pack_forget()
             if not self.tree_artists.get_children():
                 self._lib_show_artists()
 
+        elif cur == 2:
+            # 新歌曲：隐藏「⚙ 设置」，高度走探针法，直接返回
+            self.btn_settings.pack_forget()
+            self._ns_ensure_loaded()
+            if self._ns_view == "list":
+                self._set_panel_height(480)
+            else:
+                self.panel.after(20, self._ns_fit_grid_height)
+            return
+
+        # 播放中 / 音乐库：按各自模式恢复面板高度
         h = self._calc_panel_height()
         self.panel.update_idletasks()
         try:
@@ -1858,6 +2025,11 @@ class ControlPanel:
                 self.cfg.OVERLAY_VISIBLE = vis
                 self.cfg.save()
         except Exception:
+                    pass        
+        try:
+            if self._ns_current_album and self.ns_list_wrap.winfo_ismapped():
+                self._update_ns_now_playing()
+        except Exception:
             pass
 
     @staticmethod
@@ -2299,6 +2471,22 @@ class ControlPanel:
         self._lyrics_source = ""
         self.track_info = {}
 
+        self._ns_loaded = False
+        self._ns_current_album = None
+        self._ns_cover_cache.clear()
+        self._ns_album_cover_cache.clear()
+        self._ns_first_track_cache.clear()
+        self._ns_grid_panel_h = None
+                        
+        try:
+            if self.nb.index(self.nb.select()) == 2:
+                self._ns_view = "grid"
+                if self.ns_list_wrap.winfo_ismapped():
+                    self._ns_back_to_grid()
+                self._ns_refresh()
+        except Exception:
+            pass
+        
         try:
             self.btn_shutdown.set_text("⏻ 达菲")
             self.btn_shutdown.set_state(True)
@@ -2622,3 +2810,727 @@ class ControlPanel:
         canvas.config(cursor="hand2")
         redraw()
         return frame, redraw
+
+    # ================= 新歌曲 =================
+    def _ns_ensure_loaded(self):
+        if self._ns_loaded and self._ns_albums:
+            return
+        self._ns_refresh()
+
+    def _ns_refresh(self):
+        if self.ns_list_wrap.winfo_ismapped():
+            self._ns_back_to_grid()
+        self.lbl_ns_title.config(text="加载最新专辑…")
+
+        def work():
+            try:
+                albums = self.lms.browse_new_albums(60)
+            except Exception as e:
+                print(f"[新歌曲] 加载失败: {e}")
+                albums = []
+            try:
+                self.panel.after(
+                    0, lambda a=albums: self._ns_on_albums_loaded(a))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ns_on_albums_loaded(self, albums):
+        self._ns_loaded = bool(albums)
+        self._ns_view = "grid"
+        if not albums:
+            self.lbl_ns_title.config(text="未获取到最新专辑，点 ↻ 重试")
+            return
+        self.lbl_ns_title.config(text=f"最新专辑 · 共 {len(albums)} 张")
+        self._ns_fill_albums(albums)
+
+    def _ns_fill_albums(self, albums):
+        self._ns_grid_panel_h = None        
+        try:
+            for w in self.ns_inner.winfo_children():
+                w.destroy()
+        except tk.TclError:
+            return
+        self._ns_albums = albums
+        for i in range(3):
+            self.ns_inner.grid_columnconfigure(i, weight=1, uniform="nscol")
+        if not albums:
+            return
+
+        size = self._ns_cover_size
+        for idx, (aid, name, _artist, coverid) in enumerate(albums):
+            r, c = divmod(idx, 3)
+            card = tk.Frame(self.ns_inner, bg=self.BG)
+            card.grid(row=r, column=c, padx=4, pady=4, sticky="n")
+
+            cover = tk.Canvas(card, width=size, height=size, bg=self.CARD,
+                              highlightthickness=0, bd=0, cursor="hand2")
+            cover.pack()
+            self._ns_placeholder(cover)
+            cover.bind("<Button-1>",
+                       lambda e, a=aid, n=name: self._ns_open_album(a, n))
+
+            name_lbl = tk.Label(card, text=name or "未知专辑", bg=self.BG,
+                                fg=self.FG,
+                                font=("Microsoft YaHei UI", 9),
+                                wraplength=size, justify="center", anchor="n")
+            name_lbl.pack(fill="x", pady=(4, 0))
+            name_lbl.bind("<Button-1>",
+                          lambda e, a=aid, n=name: self._ns_open_album(a, n))
+
+            for w in (card, cover, name_lbl):
+                w.bind("<MouseWheel>", self._ns_on_wheel)
+
+            self._ns_enqueue_cover(aid, cover)
+
+        try:
+            self.ns_canvas.yview_moveto(0)
+            self.ns_inner.update_idletasks()
+            self.ns_canvas.configure(scrollregion=self.ns_canvas.bbox("all"))
+        except tk.TclError:
+            pass
+        self.panel.after(60, self._ns_fit_grid_height)        
+
+    def _ns_placeholder(self, canvas):
+        try:
+            s = self._ns_cover_size
+            canvas.delete("all")
+            canvas.create_rectangle(0, 0, s, s, fill=self.CARD, outline="")
+            canvas.create_oval(s * 0.2, s * 0.2, s * 0.8, s * 0.8,
+                               fill=self.SEL_BG, outline="")
+            canvas.create_oval(s * 0.42, s * 0.42, s * 0.58, s * 0.58,
+                               fill=self.ACCENT, outline="")
+        except tk.TclError:
+            pass
+
+    # ---------- 高度自适应 ----------
+    def _set_panel_height(self, h):
+        try:
+            self.panel.geometry(f"500x{int(h)}")
+        except tk.TclError:
+            pass
+
+    def _ns_apply_layout_height(self):
+        try:
+            if self.nb.index(self.nb.select()) != 2:
+                return
+        except (tk.TclError, ValueError):
+            return
+        try:
+            self.panel.update_idletasks()
+        except tk.TclError:
+            return
+        if self._ns_view == "list":
+            self._set_panel_height(480)
+            return
+        if self._ns_grid_panel_h:
+            self._set_panel_height(self._ns_grid_panel_h)
+            return
+        self._ns_fit_grid_height()
+
+    def _ns_fit_grid_height(self, retries=3):
+        """让新歌曲网格视口恰好容纳 3 列 × 3 行。
+           直接读当前 panel 与 canvas 高度求差作为固定部分高度，
+           ★ 不改变 panel 大小：避免 WM resize 延迟导致 panel/canvas
+             取到不同布局快照而使 other_h 偏大。
+           布局尚未稳定时自动重试。"""
+        if self._ns_view != "grid":
+            return
+        try:
+            if self.nb.index(self.nb.select()) != 2:
+                return
+        except (tk.TclError, ValueError):
+            return
+
+        try:
+            self.panel.update_idletasks()
+        except tk.TclError:
+            return
+
+        try:
+            # ① 目标内容高度 content_h（3 行）
+            children = self.ns_inner.winfo_children()
+            if not children:
+                try:
+                    f = tkfont.Font(family="Microsoft YaHei UI", size=9)
+                    name_h = f.metrics("linespace")
+                except tk.TclError:
+                    name_h = 20
+                content_h = 3 * (self._ns_cover_size + 4 + name_h) + 24
+            else:
+                def _row_h(i):
+                    cs = children[i * 3: i * 3 + 3]
+                    return max(c.winfo_reqheight() for c in cs) if cs else 0
+                row_hs = [_row_h(i) for i in range(3)]
+                row_hs = [h for h in row_hs if h > 0]
+                content_h = sum(row_hs) + 8 * len(row_hs)
+
+            # ② 读当前同一次布局快照下的 panel / canvas 高度
+            panel_h = self.panel.winfo_height()
+            canvas_h = self.ns_canvas.winfo_height()
+
+            # ③ 合理性检查（布局未稳定 → 重试）
+            if panel_h < 100 or canvas_h < 20 or canvas_h >= panel_h:
+                if retries > 0:
+                    self.panel.after(
+                        80, lambda: self._ns_fit_grid_height(retries - 1))
+                return
+
+            other_h = panel_h - canvas_h
+            new_h = max(280, min(int(other_h + content_h), 1000))
+            self._ns_grid_panel_h = new_h
+            if abs(new_h - panel_h) > 2:
+                self._set_panel_height(new_h)
+        except (tk.TclError, ValueError):
+            pass
+
+    def _ns_on_wheel(self, event):
+        if not self.ns_grid_wrap.winfo_ismapped():
+            return None
+        try:
+            delta = event.delta
+        except AttributeError:
+            return None
+        if not delta:
+            return None
+        steps = int(-delta / 120)
+        if steps == 0:
+            steps = -1 if delta > 0 else 1
+        try:
+            self.ns_canvas.yview_scroll(steps * 2, "units")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _ns_open_album(self, album_id, album_name):
+        if not album_id:
+            return
+        album_info = None
+        for a in self._ns_albums:
+            if str(a[0]) == str(album_id):
+                album_info = a  # (aid, name, artist, coverid)
+                break
+        artist_name = album_info[2] if album_info else ""
+        coverid = album_info[3] if album_info else ""
+
+        self.lbl_ns_title.config(text=f"加载 {album_name} …")
+        try:
+            self.btn_ns_back.pack(side="left", padx=(0, 4),
+                                  before=self.lbl_ns_title)
+        except tk.TclError:
+            pass
+
+        def work():
+            try:
+                tracks = self.lms.browse_tracks(album_id)
+            except Exception as e:
+                print(f"[新歌曲] 加载专辑歌曲失败: {e}")
+                tracks = []
+            try:
+                self.panel.after(
+                    0, lambda t=tracks, n=album_name, ar=artist_name,
+                    ai=album_id, cv=coverid:
+                    self._ns_show_tracks(t, n, ar, ai, cv))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+    def _ns_set_now_text(self, text):
+        """底部中间歌名：单行显示，宽度不足时自动缩小字号（最小 8pt）。"""
+        if not text:
+            try:
+                self.lbl_ns_now.config(text="")
+            except tk.TclError:
+                pass
+            return
+        try:
+            self.panel.update_idletasks()
+            avail = self.ns_center.winfo_width()
+        except tk.TclError:
+            avail = 0
+        if avail <= 10:
+            avail = 200
+        max_w = max(60, avail - 4)
+
+        size = 11
+        final = 8
+        while size >= 8:
+            try:
+                f = tkfont.Font(family="Microsoft YaHei UI",
+                                size=size, weight="bold")
+            except tk.TclError:
+                break
+            if f.measure(text) <= max_w:
+                final = size
+                break
+            size -= 1
+
+        try:
+            self.lbl_ns_now.config(
+                text=text,
+                font=("Microsoft YaHei UI", final, "bold"))
+        except tk.TclError:
+            pass
+            
+    def _ns_set_album_text(self, text):
+        """底部右侧专辑名：单行显示，宽度不足时自动缩小字号（最小 9pt），
+           不使用省略号。"""
+        if not text:
+            try:
+                self.lbl_ns_album.config(
+                    text="", font=("Microsoft YaHei UI", 18, "bold"))
+            except tk.TclError:
+                pass
+            return
+        try:
+            self.panel.update_idletasks()
+            bar_w = self.ns_bottom_bar.winfo_width()
+            center_visible = bool(self.ns_center.winfo_ismapped())
+        except tk.TclError:
+            bar_w = 0
+            center_visible = False
+        if bar_w <= 100:
+            bar_w = 480
+
+        reserve = 140 if center_visible else 8
+        max_w = max(80, bar_w - 72 - 22 - reserve - 24)
+
+        size = 18
+        final = 9
+        while size >= 9:
+            try:
+                f = tkfont.Font(family="Microsoft YaHei UI",
+                                size=size, weight="bold")
+            except tk.TclError:
+                break
+            if f.measure(text) <= max_w:
+                final = size
+                break
+            size -= 1
+
+        try:
+            self.lbl_ns_album.config(
+                text=text,
+                font=("Microsoft YaHei UI", final, "bold"))
+        except tk.TclError:
+            pass
+        
+    def _ns_show_tracks(self, tracks, album_name,
+                        artist_name="", album_id="", coverid=""):
+        try:
+            self.ns_grid_wrap.pack_forget()
+            self.ns_list_wrap.pack(fill="both", expand=True)
+            self._ns_view = "list"
+
+            self.ns_tree.delete(*self.ns_tree.get_children())
+            self._ns_tracks.clear()
+            for tid, tno, tname in tracks:
+                iid = f"nstr{tid}"
+                label = f"{tno}. {tname}" if tno else tname
+                self.ns_tree.insert("", "end", iid=iid, text=label)
+                self._ns_tracks[iid] = (str(tid), tname)
+
+            self.lbl_ns_title.config(text=f"{album_name} · {len(tracks)} 首")
+            self.lbl_ns_artist.config(text=artist_name or "")
+
+            self._ns_current_album = (
+                album_id, album_name, artist_name, coverid)
+
+            self._ns_load_album_cover(album_id)
+            # 先更新中间区显隐，再让 _update_ns_now_playing 内部统一适配专辑名字号
+            self._update_ns_now_playing(force=True)
+
+            children = self.ns_tree.get_children()
+            if children:
+                self.ns_tree.selection_set(children[0])
+                self.ns_tree.focus(children[0])
+                self.ns_tree.focus_set()                            
+        except tk.TclError:
+            pass
+        self.panel.after(10, self._ns_apply_layout_height)         
+
+    def _ns_back_to_grid(self):
+        try:
+            self.ns_list_wrap.pack_forget()
+            self.ns_grid_wrap.pack(fill="both", expand=True)
+            self.btn_ns_back.pack_forget()
+            self._ns_view = "grid"
+            self._ns_current_album = None
+            self.lbl_ns_title.config(
+                text=f"最新专辑 · 共 {len(self._ns_albums)} 张")
+            self.panel.focus_set()
+        except tk.TclError:
+            pass
+        self.panel.after(10, self._ns_apply_layout_height)        
+
+    def _ns_on_escape(self, _e=None):
+        self._ns_back_to_grid()
+        return "break"
+
+    def _on_ns_track_activate(self, _e=None):
+        sel = self.ns_tree.selection()
+        if not sel:
+            return "break"
+        info = self._ns_tracks.get(sel[0])
+        if not info:
+            return "break"
+        tid, tname = info
+        self.lbl_ns_now.config(text=tname)
+
+        def work():
+            try:
+                self.lms.play_track(tid)
+            except Exception:
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+        return "break"
+
+    # ---------- 底部大图 ----------
+    def _ns_load_album_cover(self, album_id):
+        """底部大图：同样用首曲封面。"""
+        key = album_id
+        if key in self._ns_album_cover_cache:
+            self._ns_set_album_cover(self._ns_album_cover_cache[key])
+            return
+
+        try:
+            c = self.ns_album_cover
+            c.delete("all")
+            c.create_rectangle(0, 0, 72, 72, fill=self.SEL_BG, outline="")
+            c.create_oval(20, 20, 52, 52, fill=self.ACCENT, outline="")
+        except tk.TclError:
+            pass
+        if not HAS_PIL:
+            return
+
+        def work():
+            data = self._ns_resolve_cover(album_id)
+            if not data:
+                return
+            try:
+                img = Image.open(BytesIO(data)).convert("RGB")
+                w, h = img.size
+                side = min(w, h)
+                left = (w - side) // 2
+                top = (h - side) // 2
+                img = img.crop((left, top, left + side, top + side))
+                try:
+                    resample = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample = Image.LANCZOS
+                img = img.resize((72, 72), resample)
+            except Exception:
+                return
+            try:
+                self.panel.after(0, lambda im=img, k=key:
+                                 self._ns_set_album_cover_pil(im, k))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ns_set_album_cover_pil(self, img, key):
+        try:
+            photo = ImageTk.PhotoImage(img)
+            self._ns_album_cover_cache[key] = photo
+            self._ns_set_album_cover(photo)
+        except Exception:
+            pass
+
+    def _ns_set_album_cover(self, photo):
+        try:
+            c = self.ns_album_cover
+            c.delete("all")
+            c.create_image(36, 36, image=photo)
+            c.image = photo
+        except tk.TclError:
+            pass
+
+    def _ns_set_album_cover_pil(self, img, key):
+        try:
+            photo = ImageTk.PhotoImage(img)
+            self._ns_album_cover_cache[key] = photo
+            self._ns_set_album_cover(photo)
+        except Exception:
+            pass
+
+    def _ns_set_album_cover(self, photo):
+        try:
+            c = self.ns_album_cover
+            c.delete("all")
+            c.create_image(36, 36, image=photo)
+            c.image = photo
+        except tk.TclError:
+            pass
+
+    # ---------- 正在播放行 ----------
+    def _update_ns_now_playing(self, force=False):
+        if not self._ns_current_album:
+            return
+        if not force and not self.ns_list_wrap.winfo_ismapped():
+            return
+        _album_id, album_name, _artist, _coverid = self._ns_current_album
+        ti = self.track_info or {}
+        cur_album = (ti.get("album", "") or "").strip()
+        cur_title = (ti.get("title", "") or "").strip()
+        show = (bool(cur_title)
+                and bool(album_name)
+                and cur_album == album_name.strip())
+        try:
+            if show:
+                if not self.ns_center.winfo_ismapped():
+                    # after=封面：保持右侧 → 封面 → 中间的 pack 顺序
+                    self.ns_center.pack(side="left", fill="both",
+                                        expand=True, pady=12,
+                                        after=self.ns_album_cover)
+                    try:
+                        self.panel.update_idletasks()
+                    except tk.TclError:
+                        pass
+                self._ns_set_now_text(cur_title)
+
+                # 布局稳定后按真实宽度再修正一次字号
+                def _defer(t=cur_title, an=album_name):
+                    try:
+                        if not self._ns_current_album:
+                            return
+                        if self._ns_current_album[1] != an:
+                            return
+                        self._ns_set_now_text(t)
+                    except tk.TclError:
+                        pass
+                try:
+                    self.panel.after(30, _defer)
+                except tk.TclError:
+                    pass
+            else:
+                if self.ns_center.winfo_ismapped():
+                    self.ns_center.pack_forget()
+                    try:
+                        self.panel.update_idletasks()
+                    except tk.TclError:
+                        pass
+
+            # 中间区显隐会改变右侧可用宽度 → 重新适配专辑名字号
+            self._ns_set_album_text(album_name)
+        except tk.TclError:
+            pass
+
+    # ---------- 封面异步加载（网格） ----------
+    def _ns_enqueue_cover(self, album_id, canvas):
+        key = album_id
+        if key in self._ns_cover_cache:
+            self._ns_apply_cover(canvas, self._ns_cover_cache[key])
+            return
+        if not HAS_PIL:
+            return
+        self._ns_cover_queue.put((album_id, canvas, key))
+
+    def _ns_cover_worker(self):
+        while True:
+            try:
+                album_id, canvas, key = self._ns_cover_queue.get()
+            except Exception:
+                return
+
+            if key in self._ns_cover_cache:
+                try:
+                    self.panel.after(
+                        0, lambda cv=canvas, p=self._ns_cover_cache[key]:
+                        self._ns_apply_cover(cv, p))
+                except tk.TclError:
+                    pass
+                continue
+
+            data = self._ns_resolve_cover(album_id)
+            if not data:
+                continue
+
+            try:
+                img = Image.open(BytesIO(data)).convert("RGB")
+                w, h = img.size
+                side = min(w, h)
+                left = (w - side) // 2
+                top = (h - side) // 2
+                img = img.crop((left, top, left + side, top + side))
+                try:
+                    resample = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample = Image.LANCZOS
+                img = img.resize((self._ns_cover_size, self._ns_cover_size),
+                                 resample)
+            except Exception:
+                continue
+
+            try:
+                self.panel.after(
+                    0, lambda cv=canvas, im=img, k=key:
+                    self._ns_apply_cover_pil(cv, im, k))
+            except tk.TclError:
+                pass
+
+    def _ns_apply_cover_pil(self, canvas, img, key):
+        try:
+            if not canvas.winfo_exists():
+                return
+            photo = ImageTk.PhotoImage(img)
+            self._ns_cover_cache[key] = photo
+            self._ns_apply_cover(canvas, photo)
+        except Exception:
+            pass
+
+    def _ns_apply_cover(self, canvas, photo):
+        try:
+            if not canvas.winfo_exists():
+                return
+            s = self._ns_cover_size
+            canvas.delete("all")
+            canvas.create_image(s // 2, s // 2, image=photo)
+            canvas.image = photo
+        except tk.TclError:
+            pass
+
+    # ---------- 首曲封面解析（核心） ----------
+    def _ns_get_first_track_ids(self, album_id):
+        """查专辑首曲的 (coverid, track_id)，带缓存。"""
+        if album_id in self._ns_first_track_cache:
+            return self._ns_first_track_cache[album_id]
+        result = ("", "")
+        try:
+            res = self.lms.command(
+                ["titles", 0, 1, f"album_id:{album_id}", "tags:K"],
+                player="-")
+            loop = res.get("titles_loop", []) or []
+            if loop:
+                t = loop[0]
+                result = (str(t.get("coverid") or ""),
+                          str(t.get("id") or ""))
+        except Exception as e:
+            print(f"[新歌曲] 查询首曲失败 album={album_id}: {e}")
+        self._ns_first_track_cache[album_id] = result
+        return result
+
+    def _ns_resolve_cover(self, album_id):
+        """只用「首曲 coverid / track_id」请求封面。
+           （不用 album_id 兜底：LMS 会返回默认占位图，导致误判成功）"""
+        first_cover, first_tid = self._ns_get_first_track_ids(album_id)
+        candidates = []
+        if first_cover and first_cover not in ("0", "-"):
+            candidates.append(first_cover)
+        if first_tid and first_tid not in candidates:
+            candidates.append(first_tid)
+        if not candidates:
+            return None
+        return self._ns_try_cover_urls(self.lms.host, self.lms.port, candidates)
+
+    @staticmethod
+    def _ns_try_cover_urls(host, port, ids):
+        """对每个 id 依次尝试 cover.jpg / cover_200x200.jpg；命中返回字节。"""
+        for id_ in ids:
+            for suffix in ("cover.jpg", "cover_200x200.jpg"):
+                url = f"http://{host}:{port}/music/{id_}/{suffix}"
+                try:
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": "lms-karaoke/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        data = r.read()
+                    if not data or len(data) < 100:
+                        continue
+                    if (data[:3] == b"\xff\xd8\xff"
+                            or data[:8] == b"\x89PNG\r\n\x1a\n"):
+                        return data
+                except Exception:
+                    continue
+        return None
+    
+    # ================= 圆形返回按钮 =================
+    def _get_back_icon(self, size, color, hover):
+        """PIL 超采样生成平滑的 chevron ‹ 图标，按 (size, color, hover) 缓存。"""
+        if not hasattr(self, "_back_icon_cache"):
+            self._back_icon_cache = {}
+        key = (size, color, hover)
+        if key in self._back_icon_cache:
+            return self._back_icon_cache[key]
+        if not HAS_PIL:
+            return None
+        try:
+            ss = 4
+            W = size * ss
+            img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            if hover:
+                d.ellipse((0, 0, W - 1, W - 1), fill=self.SEL_BG)
+            lw = max(2, int(W * 0.09))
+            r = lw // 2
+            cy = W * 0.5
+            x_tip = W * 0.38
+            x_end = W * 0.62
+            y_top = W * 0.30
+            y_bot = W * 0.70
+            for seg in ([(x_end, y_top), (x_tip, cy)],
+                        [(x_tip, cy), (x_end, y_bot)]):
+                d.line(seg, fill=color, width=lw)
+            for px, py in ((x_end, y_top), (x_tip, cy), (x_end, y_bot)):
+                d.ellipse((px - r, py - r, px + r, py + r), fill=color)
+            small = img.resize((size, size), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(small)
+            self._back_icon_cache[key] = photo
+            return photo
+        except Exception:
+            return None
+
+    def _make_back_button(self, parent, cmd, size=24):
+        """无文字的圆形返回按钮：非 hover 只显示箭头；
+           hover 出现 SEL_BG 圆底，整体风格与主面板按钮一致。"""
+        canvas = tk.Canvas(parent, width=size, height=size, bg=self.BG,
+                           highlightthickness=0, bd=0, cursor="hand2")
+        state = {"hover": False}
+
+        def redraw():
+            try:
+                canvas.delete("all")
+                color = self.FG
+                photo = self._get_back_icon(size, color, state["hover"])
+                if photo is not None:
+                    canvas.create_image(size // 2, size // 2, image=photo)
+                    canvas._img = photo
+                else:
+                    # PIL 不可用：canvas 原生画线兜底
+                    if state["hover"]:
+                        canvas.create_oval(1, 1, size - 1, size - 1,
+                                           fill=self.SEL_BG, outline="")
+                    w = max(2, size // 12)
+                    canvas.create_line(
+                        size * 0.62, size * 0.30,
+                        size * 0.40, size * 0.50,
+                        size * 0.62, size * 0.70,
+                        fill=color, width=w,
+                        capstyle="round", joinstyle="round")
+            except tk.TclError:
+                pass
+
+        def on_click(_e):
+            cmd()
+
+        def on_enter(_e):
+            state["hover"] = True
+            redraw()
+
+        def on_leave(_e):
+            state["hover"] = False
+            redraw()
+
+        def _update_theme(panel):
+            canvas.configure(bg=panel.BG)
+            redraw()
+
+        canvas._update_theme = _update_theme
+
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Enter>", on_enter)
+        canvas.bind("<Leave>", on_leave)
+        redraw()
+        return canvas
+   
