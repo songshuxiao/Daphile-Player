@@ -20,8 +20,7 @@ from discovery import NetDiscovery
 from lms_client import LmsClient
 from lyrics_fetcher import LyricsFetcher
 from karaoke_overlay import KaraokeOverlay
-from control_panel import ControlPanel
-
+from control_panel import ControlPanel, apply_dark_titlebar
 
 def _resource_path(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -164,6 +163,10 @@ class ConnectDialog:
         self.win.after(100, self._poll_queue)
 
         self._build_ui()
+        try:
+            apply_dark_titlebar(self.win, dark=True, bg_color=self.BG)
+        except Exception:
+            pass        
         self.win.after(50, lambda: self.ent_ip.focus_set())
 
         if auto_scan:

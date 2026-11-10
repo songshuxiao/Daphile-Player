@@ -11,6 +11,10 @@ import traceback
 import urllib.request
 import webbrowser
 import tkinter as tk
+try:
+    import ctypes
+except ImportError:
+    ctypes = None
 from tkinter import ttk, colorchooser, messagebox, font as tkfont
 from io import BytesIO
 
@@ -23,7 +27,7 @@ except ImportError:
     HAS_PIL = False
 
 
-APP_VERSION = "v6.0.0"
+APP_VERSION = "v7.0.0"
 APP_REPO = "songshuxiao/Daphile-Player"
 GITHUB_URL = f"https://github.com/{APP_REPO}"
 RELEASES_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
@@ -34,6 +38,63 @@ def _resource_path(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
 
+def apply_dark_titlebar(window, dark=True, bg_color=None):
+    """Windows 10 build 17763+ / Windows 11：把 Toplevel 的标题栏设为深色。
+       dark=True 且 bg_color="#RRGGBB" 时，Win11 22000+ 会自定义标题栏颜色；
+       浅色模式下恢复系统默认标题栏。非 Windows 平台无副作用。"""
+    if os.name != "nt" or ctypes is None:
+        return
+    try:
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        if not hwnd:
+            hwnd = window.winfo_id()
+        if not hwnd:
+            return
+
+        # 20 = Win10 18985+ / Win11 新属性；19 = Win10 17763~18984 旧属性
+        val = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):
+            try:
+                hr = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
+                if hr == 0:
+                    break
+            except Exception:
+                continue
+
+        if dark and bg_color:
+            try:
+                h = bg_color.lstrip("#")
+                if len(h) == 6:
+                    r = int(h[0:2], 16)
+                    g = int(h[2:4], 16)
+                    b = int(h[4:6], 16)
+                    # COLORREF = 0x00BBGGRR
+                    colorref = ctypes.c_uint(r | (g << 8) | (b << 16))
+                    ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, 35, ctypes.byref(colorref),
+                        ctypes.sizeof(colorref))
+                    # 浅色文字（暗背景上可读）
+                    txt = ctypes.c_uint(0xF0 | (0xF0 << 8) | (0xF8 << 16))
+                    ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, 36, ctypes.byref(txt),
+                        ctypes.sizeof(txt))
+            except Exception:
+                pass
+        else:
+            # 浅色模式：恢复系统默认标题栏
+            try:
+                default = ctypes.c_uint(0xFFFFFFFF)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 35, ctypes.byref(default),
+                    ctypes.sizeof(default))
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 36, ctypes.byref(default),
+                    ctypes.sizeof(default))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 class CanvasSlider(tk.Canvas):
     """圆角、可拖动的水平滑块，兼容 ttk.Scale 的常用接口"""
@@ -270,7 +331,21 @@ class ControlPanel:
         self._ns_cover_queue = queue.Queue()
         self._ns_first_track_cache = {}   # album_id -> (coverid, track_id)
         self._ns_grid_panel_h = None      # 网格模式下面板高度缓存        
-
+        self._ns_last_synced_track = None   # 上次同步到 Treeview 的 track_id
+        # —— 简洁模式 ——
+        self._compact_mode = False
+        self._compact_saved = {}
+        self._compact_root = None
+        self._compact_card = None
+        self._compact_cover = None
+        self._compact_title = None
+        self._compact_artist = None
+        self._compact_ctl = None
+        self._compact_prev = None
+        self._compact_play = None
+        self._compact_next = None
+        self._compact_restore = None
+        
         # 键盘导航标志位
         self._kb_focus_albums = False
         self._kb_select_tracks = False
@@ -305,7 +380,12 @@ class ControlPanel:
 
         if getattr(self.cfg, "AUTO_CHECK_UPDATE", True):
             self.panel.after(3000, lambda: self._check_update(auto=True))
-
+        # 标题栏深色（窗口真正映射后再设置更可靠）
+        try:
+            self.panel.after(150, self._apply_titlebar_theme)
+        except tk.TclError:
+            pass
+        
     # ================= 键盘快捷键 =================
     def _on_key_press(self, event):
         w = event.widget
@@ -315,6 +395,8 @@ class ControlPanel:
 
         # Tab 循环切换 播放中 → 音乐库 → 新歌曲 → 播放中
         if event.keysym == "Tab":
+            if self._compact_mode:
+                return "break"
             cur = self.nb.index(self.nb.select())
             new_tab = (cur + 1) % 3
             self.nb.select(new_tab)
@@ -719,6 +801,7 @@ class ControlPanel:
 
         head = tk.Frame(p, bg=self.BG)
         head.pack(fill="x", padx=10, pady=(10, 4))
+        self.head = head                       # ★ 新增
 
         self.lbl_server = tk.Label(head, text="服务器: 搜索中…", bg=self.BG,
                                    fg=self.ACCENT, font=("Microsoft YaHei UI", 9, "underline"),
@@ -727,14 +810,20 @@ class ControlPanel:
         self.lbl_server.bind("<Button-1>", self._open_lms_web)
 
         self.btn_daphile_settings = self._make_round_btn(
-            head, "达菲设置", self._open_daphile_settings,
-            width=64, height=22, radius=6)
+            head, "⚙", self._open_daphile_settings,
+            width=22, height=22, radius=8)
         self.btn_daphile_settings.pack(side="left", padx=(10, 0))
 
         self.lbl_player = tk.Label(head, text="播放器: … ▼", bg=self.BG, fg=self.DIM,
                                    font=("Microsoft YaHei UI", 9), cursor="hand2")
         self.lbl_player.pack(side="right")
         self.lbl_player.bind("<Button-1>", self._show_players_menu)
+
+        # ★ ⏻达菲 
+        self.btn_shutdown = self._make_round_btn(
+            head, "⏻ 达菲", self._shutdown_daphile,
+            width=64, height=22, radius=8)
+        self.btn_shutdown.pack(side="right", padx=(0, 6))
 
         nb = ttk.Notebook(p)
         nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -745,6 +834,7 @@ class ControlPanel:
 
         btn_group = tk.Frame(nb, bg=self.BG)
         btn_group.place(relx=1.0, x=-8, y=10, anchor="ne")
+        self._btn_group_widget = btn_group     # ★ 新增
 
         self.btn_settings = self._make_round_btn(
             btn_group, "⚙ 设置", self._toggle_lyrics_panel,
@@ -756,17 +846,20 @@ class ControlPanel:
             width=64, height=22, radius=8)
         self.btn_lyrics.pack(side="left", padx=(0, 6))
 
-        self.btn_shutdown = self._make_round_btn(
-            btn_group, "⏻ 达菲", self._shutdown_daphile,
+        # ★ 简洁按钮
+        self.btn_compact = self._make_round_btn(
+            btn_group, "📌 简洁", self._toggle_compact_mode,
             width=64, height=22, radius=8)
-        self.btn_shutdown.pack(side="left")
+        self.btn_compact.pack(side="left")
 
         # ================= TAB 1：正在播放 =================
         f1 = ttk.Frame(nb, padding=10)
         nb.add(f1, text="播放中")
+        self._f1 = f1                          # ★ 新增
 
         card = tk.Frame(f1, bg=self.CARD)
         card.pack(fill="x", pady=(0, 8))
+        self._card = card                      # ★ 新增
 
         self.cover_canvas = tk.Canvas(card, width=72, height=72,
                                       bg=self.CARD, highlightthickness=0, bd=0)
@@ -774,6 +867,8 @@ class ControlPanel:
 
         info = tk.Frame(card, bg=self.CARD)
         info.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+        self._info_widget = info
+
         self.lbl_title = tk.Label(info, text="—", bg=self.CARD, fg=self.FG,
                                   font=("Microsoft YaHei UI", 14, "bold"),
                                   anchor="w", justify="left", wraplength=320)
@@ -799,6 +894,7 @@ class ControlPanel:
 
         ctl = tk.Frame(f1, bg=self.BG)
         ctl.pack(pady=(10, 6))
+        self._ctl = ctl                        # ★ 新增
 
         self.btn_prev = self._make_play_btn(
             ctl, "◀◀", lambda: self._cmd("prev"),
@@ -818,6 +914,7 @@ class ControlPanel:
         # ★ 音量控制行：喇叭图标 + 百分比 + 滑块
         vol_row = tk.Frame(f1, bg=self.BG)
         vol_row.pack(fill="x", pady=(0, 10))
+        self._vol_row = vol_row                # ★ 新增
         tk.Label(vol_row, text="🔊", bg=self.BG, fg=self.DIM,
                  font=("Segoe UI Emoji", 12)).pack(side="left")
         self.lbl_vol_pct = tk.Label(
@@ -1154,6 +1251,18 @@ class ControlPanel:
         self._theme_toggle.set_value(self.cfg.DARK_MODE)
         self._apply_theme()
 
+    def _apply_titlebar_theme(self):
+        """把主面板标题栏同步为当前主题。"""
+        if self._compact_mode:
+            return
+        try:
+            if self.cfg.DARK_MODE:
+                apply_dark_titlebar(self.panel, dark=True, bg_color=self.BG)
+            else:
+                apply_dark_titlebar(self.panel, dark=False)
+        except Exception:
+            pass
+
     def _apply_theme(self):
         if self.cfg.DARK_MODE:
             old_colors = {
@@ -1187,7 +1296,8 @@ class ControlPanel:
         self._icon_cache.clear()
         if hasattr(self, "_back_icon_cache"): self._back_icon_cache.clear()
         self._ns_grid_panel_h = None
-
+        if hasattr(self, "_pin_icon_cache"): self._pin_icon_cache.clear()
+        
         self._update_custom_widgets(self.panel)
         self._lib_refresh()
         
@@ -1226,7 +1336,11 @@ class ControlPanel:
             self.lbl_lib.config(bg=self.BG, fg=self.DIM)
         except Exception:
             pass
-
+        try:
+            self._apply_titlebar_theme()
+        except Exception:
+            pass
+        
     def _recolor_widgets(self, widget, mapping):
         try:
             for prop in ("bg", "fg", "activebackground", "activeforeground", 
@@ -1293,6 +1407,8 @@ class ControlPanel:
         return 490 if self._lyrics_appearance_visible else 365
 
     def _on_tab_changed(self, _e=None):
+        if self._compact_mode:
+            return
         try:
             cur = self.nb.index(self.nb.select())
         except Exception:
@@ -1598,6 +1714,13 @@ class ControlPanel:
             pass
 
         win.update_idletasks()
+        try:
+            if self.cfg.DARK_MODE:
+                apply_dark_titlebar(win, dark=True, bg_color=self.BG)
+            else:
+                apply_dark_titlebar(win, dark=False)
+        except Exception:
+            pass        
         px = self.panel.winfo_rootx() + (self.panel.winfo_width() - 540) // 2
         py = self.panel.winfo_rooty() + (self.panel.winfo_height() - 320) // 2
         win.geometry(f"+{px}+{py}")
@@ -1842,12 +1965,16 @@ class ControlPanel:
         c.create_arc(cx - 26, cy - 26, cx + 26, cy + 26, start=30, extent=60,
                      style="arc", outline="#4A4A6A", width=2)
         self._cover_photo = None
+        if self._compact_mode:
+            self._copy_cover_to_compact()
 
     def _set_cover_image(self, photo):
         c = self.cover_canvas
         c.delete("all")
         self._cover_photo = photo
         c.create_image(36, 36, image=photo)
+        if self._compact_mode:
+            self._copy_cover_to_compact()
 
     def _update_cover(self, st):
         cover_id = str(st.get("coverid", "") or "").strip()
@@ -1976,8 +2103,24 @@ class ControlPanel:
         artist = " / ".join(x for x in (info.get("artist", ""), info.get("album", "")) if x)
         self.lbl_title.config(text=title)
         self.lbl_artist.config(text=artist)
+        if self._compact_mode:
+            try:
+                if self._compact_title and self._compact_title.winfo_exists():
+                    self._compact_title.config(text=title)
+                if self._compact_artist and self._compact_artist.winfo_exists():
+                    self._compact_artist.config(text=artist)
+            except tk.TclError:
+                pass
         self.lbl_time.config(text=f"{self._fmt(self.song_pos)} / {self._fmt(self._duration)}")
-        self.btn_play.set_text("⏸" if self._playing else "▶")
+        play_text = "⏸" if self._playing else "▶"
+        self.btn_play.set_text(play_text)
+        cp = getattr(self, "_compact_play", None)
+        if cp is not None:
+            try:
+                if cp.winfo_exists():
+                    cp.set_text(play_text)
+            except tk.TclError:
+                pass
 
         if not self._seeking:
             try:
@@ -2029,6 +2172,7 @@ class ControlPanel:
         try:
             if self._ns_current_album and self.ns_list_wrap.winfo_ismapped():
                 self._update_ns_now_playing()
+                self._ns_sync_selection()
         except Exception:
             pass
 
@@ -2509,18 +2653,19 @@ class ControlPanel:
         except Exception:
             pass
     
-    def _get_circle_photo(self, diameter, color):
-        """Pillow 超采样生成抗锯齿圆，按 (直径, 颜色) 缓存。"""
+    def _get_circle_photo(self, diameter, color, bg=None):
+        """Pillow 超采样生成抗锯齿圆，按 (直径, 颜色, 背景) 缓存。"""
         if not hasattr(self, "_circle_cache"):
             self._circle_cache = {}
-        key = (diameter, color)
+        bg_color = bg if bg else self.BG
+        key = (diameter, color, bg_color)
         if key in self._circle_cache:
             return self._circle_cache[key]
         if not HAS_PIL:
             return None
         try:
             ss = 4
-            big = Image.new("RGB", (diameter * ss, diameter * ss), self.BG)
+            big = Image.new("RGB", (diameter * ss, diameter * ss), bg_color)
             bd = ImageDraw.Draw(big)
             bd.ellipse((0, 0, diameter * ss - 1, diameter * ss - 1), fill=color)
             small = big.resize((diameter, diameter), Image.LANCZOS)
@@ -3141,11 +3286,30 @@ class ControlPanel:
             # 先更新中间区显隐，再让 _update_ns_now_playing 内部统一适配专辑名字号
             self._update_ns_now_playing(force=True)
 
+            # 打开专辑时：如果正在播放的正是本专辑某首，直接选中它；
+            # 否则默认选中第一首。
+            self._ns_last_synced_track = None
+            ti = self.track_info or {}
+            cur_album = (ti.get("album", "") or "").strip()
+            cur_tid = str(ti.get("track_id") or "")
+            target_iid = None
+            if (cur_tid and album_name
+                    and cur_album == album_name.strip()):
+                cand = f"nstr{cur_tid}"
+                if cand in self._ns_tracks:
+                    target_iid = cand
+                    self._ns_last_synced_track = cur_tid
+
             children = self.ns_tree.get_children()
-            if children:
+            if target_iid:
+                self.ns_tree.selection_set(target_iid)
+                self.ns_tree.focus(target_iid)
+                self.ns_tree.see(target_iid)
+                self.ns_tree.focus_set()
+            elif children:
                 self.ns_tree.selection_set(children[0])
                 self.ns_tree.focus(children[0])
-                self.ns_tree.focus_set()                            
+                self.ns_tree.focus_set()                         
         except tk.TclError:
             pass
         self.panel.after(10, self._ns_apply_layout_height)         
@@ -3157,6 +3321,7 @@ class ControlPanel:
             self.btn_ns_back.pack_forget()
             self._ns_view = "grid"
             self._ns_current_album = None
+            self._ns_last_synced_track = None   # ★ 新增
             self.lbl_ns_title.config(
                 text=f"最新专辑 · 共 {len(self._ns_albums)} 张")
             self.panel.focus_set()
@@ -3177,6 +3342,7 @@ class ControlPanel:
             return "break"
         tid, tname = info
         self.lbl_ns_now.config(text=tname)
+        self._ns_last_synced_track = tid   # ★ 新增
 
         def work():
             try:
@@ -3315,6 +3481,46 @@ class ControlPanel:
 
             # 中间区显隐会改变右侧可用宽度 → 重新适配专辑名字号
             self._ns_set_album_text(album_name)
+        except tk.TclError:
+            pass
+
+    def _ns_sync_selection(self):
+        """播放切到新曲时，让新歌曲列表的选中项跟进到正在播放的歌曲。
+           仅在 track_id 变化时写一次 selection，避免打断用户手动选择。"""
+        if not self._ns_current_album or self._ns_view != "list":
+            return
+        try:
+            if not self.ns_list_wrap.winfo_ismapped():
+                return
+        except tk.TclError:
+            return
+
+        ti = self.track_info or {}
+        cur_album = (ti.get("album", "") or "").strip()
+        cur_tid = str(ti.get("track_id") or "")
+        if not cur_tid:
+            return
+
+        _album_id, album_name, _artist, _coverid = self._ns_current_album
+        if not album_name or cur_album != album_name.strip():
+            return
+
+        iid = f"nstr{cur_tid}"
+        if iid not in self._ns_tracks:
+            return
+
+        # 同一个 track_id 不重复写 selection，避免每 100ms 覆盖用户手动选择
+        if self._ns_last_synced_track == cur_tid:
+            return
+        self._ns_last_synced_track = cur_tid
+
+        try:
+            cur_sel = self.ns_tree.selection()
+            if cur_sel and cur_sel[0] == iid:
+                return
+            self.ns_tree.selection_set(iid)
+            self.ns_tree.focus(iid)
+            self.ns_tree.see(iid)
         except tk.TclError:
             pass
 
@@ -3533,4 +3739,477 @@ class ControlPanel:
         canvas.bind("<Leave>", on_leave)
         redraw()
         return canvas
-   
+
+    # ================= 简洁模式 =================
+    def _toggle_compact_mode(self):
+        if self._compact_mode:
+            self._exit_compact_mode()
+        else:
+            self._enter_compact_mode()
+
+    def _enter_compact_mode(self):
+        if self._compact_mode:
+            return
+        self._compact_mode = True
+        self._compact_saved = {}
+
+        # 保存几何
+        try:
+            self._compact_saved["geometry"] = self.panel.geometry()
+        except Exception:
+            self._compact_saved["geometry"] = "500x365+100+100"
+
+        # 隐藏 head 与整个 Notebook（彻底去除 tab 栏）
+        try:
+            self.head.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.nb.pack_forget()
+        except Exception:
+            pass
+        
+        # 独立简洁视图（去除四周留白）
+        self._compact_root = tk.Frame(self.panel, bg=self.BG)
+        self._compact_root.pack(fill="both", expand=True,
+                                padx=2, pady=2)
+
+        card = tk.Frame(self._compact_root, bg=self.CARD)
+        card.pack(fill="both", expand=True)
+        self._compact_card = card
+
+        # 左侧封面
+        cover_frame = tk.Frame(card, bg=self.CARD)
+        cover_frame.pack(side="left", fill="y", padx=(6, 4))
+        self._compact_cover = tk.Canvas(cover_frame, width=72, height=72,
+                                        bg=self.CARD,
+                                        highlightthickness=0, bd=0)
+        self._compact_cover.pack(expand=True)
+        self._copy_cover_to_compact()
+
+        # 右侧信息区
+        info = tk.Frame(card, bg=self.CARD)
+        info.pack(side="left", fill="both", expand=True,
+                  padx=(0, 6), pady=4)
+
+        # ① 底部行：控制按钮，整体右对齐（右下角）
+        bottom_row = tk.Frame(info, bg=self.CARD)
+        bottom_row.pack(side="bottom", fill="x", pady=(2, 0))
+        self._compact_bottom_row = bottom_row
+        self._compact_ctl = bottom_row
+
+        # ★ 用 side="right" 逆序打包，视觉顺序：◀◀ ▶ ▶▶ 贴右下角
+        self._compact_next = self._make_small_play_btn(
+            bottom_row, "▶▶", lambda: self._cmd("next"), is_play=False)
+        self._compact_next.pack(side="right", padx=2)
+
+        play_icon = "⏸" if self._playing else "▶"
+        self._compact_play = self._make_small_play_btn(
+            bottom_row, play_icon, self._toggle_play, is_play=True)
+        self._compact_play.pack(side="right", padx=2)
+
+        self._compact_prev = self._make_small_play_btn(
+            bottom_row, "◀◀", lambda: self._cmd("prev"), is_play=False)
+        self._compact_prev.pack(side="right", padx=2)
+
+        # ② 标题 / 歌手（完整定义，不可用占位符）
+        self._compact_title = tk.Label(
+            info, text=self.lbl_title.cget("text"),
+            bg=self.CARD, fg=self.FG,
+            font=("Microsoft YaHei UI", 14, "bold"),
+            anchor="w", justify="left", wraplength=260)
+        self._compact_title.pack(side="top", fill="x", anchor="w")
+
+        self._compact_artist = tk.Label(
+            info, text=self.lbl_artist.cget("text"),
+            bg=self.CARD, fg=self.DIM,
+            font=("Microsoft YaHei UI", 10),
+            anchor="w", justify="left", wraplength=260)
+        self._compact_artist.pack(side="top", fill="x", anchor="w",
+                                  pady=(2, 0))
+
+        # ③ 恢复按钮：卡片右上角
+        self._compact_restore = self._make_restore_button(card)
+        self._compact_restore.place(relx=1.0, x=-3, y=3, anchor="ne")
+
+        # ⑤ 无边框 + 置顶
+        try:
+            self.panel.overrideredirect(True)
+            self.panel.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        # ⑥ 窗口尺寸：留白缩小后重新计算，卡片更紧凑
+        try:
+            self.panel.geometry("400x100")
+        except tk.TclError:
+            pass
+        self.panel.update_idletasks()
+        try:
+            self.panel.update_idletasks()
+            req = self._compact_root.winfo_reqheight()
+            if req < 60:
+                req = 86  # 兜底
+            h = max(76, min(req + 4, 200))
+            self.panel.geometry(f"400x{h}")
+        except tk.TclError:
+            pass
+
+        self._bind_compact_drag()
+      
+
+    def _copy_cover_to_compact(self):
+        try:
+            c = self._compact_cover
+            if c is None or not c.winfo_exists():
+                return
+            c.delete("all")
+            if self._cover_photo is not None:
+                c.create_image(36, 36, image=self._cover_photo)
+                c.image = self._cover_photo
+            else:
+                dark = self.cfg.DARK_MODE
+                c.create_oval(4, 4, 68, 68,
+                              fill="#2A2A3A" if dark else "#D0D0D8",
+                              outline="#3D3D5C", width=2)
+                c.create_oval(22, 22, 50, 50, fill=self.ACCENT, outline="")
+                c.create_oval(33, 33, 39, 39, fill=self.CARD, outline="")
+        except tk.TclError:
+            pass
+
+    def _make_small_play_btn(self, parent, text, cmd, is_play=False):
+        size = 22 if is_play else 18
+        canvas = tk.Canvas(parent, width=size, height=size, bg=self.CARD,
+                           highlightthickness=0, bd=0, cursor="hand2")
+        state = {"text": text, "hover": False}
+
+        def redraw():
+            try:
+                canvas.delete("all")
+                d, c = size, size / 2
+                if is_play:
+                    fill = "#7A7AFF" if state["hover"] else self.ACCENT
+                    fg = "#FFFFFF"
+                    photo = self._get_circle_photo(size, fill, bg=self.CARD)
+                    if photo is not None:
+                        canvas.create_image(c, c, image=photo)
+                        canvas._circle_photo = photo
+                    else:
+                        canvas.create_oval(0, 0, d, d, fill=fill, outline="")
+                else:
+                    fill = self.SEL_BG
+                    fg = self.FG
+                    # 非播放按钮：仅 hover 时显示圆底
+                    if state["hover"]:
+                        photo = self._get_circle_photo(size, fill, bg=self.CARD)
+                        if photo is not None:
+                            canvas.create_image(c, c, image=photo)
+                            canvas._circle_photo = photo
+                        else:
+                            canvas.create_oval(1, 1, d - 1, d - 1,
+                                               fill=fill, outline="")
+
+                txt = state["text"]
+                if txt == "▶":
+                    tw, th = size * 0.30, size * 0.36
+                    ox = tw * 0.12
+                    canvas.create_polygon(
+                        c - tw / 2 + ox, c - th / 2,
+                        c - tw / 2 + ox, c + th / 2,
+                        c + tw / 2 + ox, c,
+                        fill=fg, outline="")
+                elif txt == "⏸":
+                    bw = max(2, size * 0.15)
+                    bh = size * 0.40
+                    gap = max(2, size * 0.10)
+                    total = bw * 2 + gap
+                    sx = c - total / 2
+                    canvas.create_rectangle(sx, c - bh / 2,
+                                            sx + bw, c + bh / 2,
+                                            fill=fg, outline="")
+                    canvas.create_rectangle(sx + bw + gap, c - bh / 2,
+                                            sx + bw * 2 + gap, c + bh / 2,
+                                            fill=fg, outline="")
+                elif txt in ("◀◀", "▶▶"):
+                    tw, th = size * 0.30, size * 0.38
+                    gap = size * 0.06
+                    total = tw * 2 + gap
+                    sx = c - total / 2
+                    for i in range(2):
+                        tx = sx + i * (tw + gap)
+                        if txt == "◀◀":
+                            canvas.create_polygon(
+                                tx, c,
+                                tx + tw, c - th / 2,
+                                tx + tw, c + th / 2,
+                                fill=fg, outline="")
+                        else:
+                            canvas.create_polygon(
+                                tx, c - th / 2,
+                                tx, c + th / 2,
+                                tx + tw, c,
+                                fill=fg, outline="")
+            except tk.TclError:
+                pass
+
+        def set_text(t):
+            state["text"] = t
+            redraw()
+
+        canvas.set_text = set_text
+        canvas._update_theme = lambda p: (canvas.configure(bg=p.CARD), redraw())
+
+        canvas.bind("<Button-1>", lambda e: cmd())
+        canvas.bind("<Enter>",
+                    lambda e: (state.update({"hover": True}), redraw()))
+        canvas.bind("<Leave>",
+                    lambda e: (state.update({"hover": False}), redraw()))
+        redraw()
+        return canvas
+    
+    # ---------- 图钉图标 ----------
+    def _get_pin_icon(self, size, color, hover):
+        """PIL 超采样绘制图钉（扁圆头 + 锥形针），按 (size, color, hover) 缓存。"""
+        if not hasattr(self, "_pin_icon_cache"):
+            self._pin_icon_cache = {}
+        key = (size, color, hover)
+        if key in self._pin_icon_cache:
+            return self._pin_icon_cache[key]
+        if not HAS_PIL:
+            return None
+        try:
+            ss = 4
+            W = size * ss
+            img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+
+            # hover：圆底
+            if hover:
+                d.ellipse((0, 0, W - 1, W - 1), fill=self.SEL_BG)
+
+            cx = W / 2
+
+            # 扁圆头
+            hw = W * 0.28
+            hh = W * 0.20
+            hcy = W * 0.34
+            d.ellipse((cx - hw, hcy - hh, cx + hw, hcy + hh),
+                      fill=color)
+
+            # 锥形针
+            n_top = hcy + hh * 0.5
+            n_bot = W * 0.86
+            lw = W * 0.09
+            d.polygon(
+                [(cx - lw, n_top), (cx + lw, n_top), (cx, n_bot)],
+                fill=color)
+
+            # 圆头高光（左上）
+            hg = W * 0.05
+            hlx = cx - hw * 0.45
+            hly = hcy - hh * 0.45
+            d.ellipse((hlx - hg, hly - hg, hlx + hg, hly + hg),
+                      fill=(255, 255, 255, 220))
+
+            small = img.resize((size, size), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(small)
+            self._pin_icon_cache[key] = photo
+            return photo
+        except Exception:
+            return None
+        
+    def _make_restore_button(self, parent, size=15):
+        """恢复完整功能按钮：实心圆（PIL 平滑）。"""
+        canvas = tk.Canvas(parent, width=size, height=size, bg=self.CARD,
+                           highlightthickness=0, bd=0, cursor="hand2")
+        state = {"hover": False}
+
+        def redraw():
+            try:
+                canvas.delete("all")
+                fill = self.HOVER_ACCENT if state["hover"] else self.ACCENT
+                photo = self._get_circle_photo(size, fill, bg=self.CARD)
+                if photo is not None:
+                    canvas.create_image(size // 2, size // 2, image=photo)
+                    canvas._circle_photo = photo
+                else:
+                    c = size / 2
+                    r = size / 2 - 2
+                    canvas.create_oval(c - r, c - r, c + r, c + r,
+                                       fill=fill, outline="")
+            except tk.TclError:
+                pass
+
+        canvas._update_theme = lambda p: (canvas.configure(bg=p.CARD),
+                                          redraw())
+
+        canvas.bind("<Button-1>", lambda e: self._exit_compact_mode())
+        canvas.bind("<Enter>",
+                    lambda e: (state.update({"hover": True}), redraw()))
+        canvas.bind("<Leave>",
+                    lambda e: (state.update({"hover": False}), redraw()))
+        redraw()
+        return canvas
+
+    def _exit_compact_mode(self):
+        if not self._compact_mode:
+            return
+        self._compact_mode = False
+
+        # 解绑拖拽全局捕获，避免影响完整模式
+        try:
+            self.panel.unbind_all("<B1-Motion>")
+            self.panel.unbind_all("<ButtonRelease-1>")
+        except tk.TclError:
+            pass
+        try:
+            self.panel.unbind("<Button-1>")
+        except tk.TclError:
+            pass
+        
+        # 销毁简洁视图
+        if self._compact_root is not None:
+            try:
+                self._compact_root.destroy()
+            except Exception:
+                pass
+        self._compact_root = None
+        self._compact_card = None
+        self._compact_cover = None
+        self._compact_title = None
+        self._compact_artist = None
+        self._compact_ctl = None
+        self._compact_prev = None
+        self._compact_play = None
+        self._compact_next = None
+        self._compact_restore = None
+
+        # 取消无边框 + 置顶
+        try:
+            self.panel.overrideredirect(False)
+            self.panel.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+        # 恢复 head（用原始硬编码 pack 参数，避免 pack_info 类型问题）
+        try:
+            self.head.pack(fill="x", padx=10, pady=(10, 4))
+        except Exception:
+            pass
+
+        # 恢复 Notebook
+        try:
+            self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        except Exception:
+            pass
+
+        # 恢复 btn_group
+        try:
+            self._btn_group_widget.place(relx=1.0, x=-8, y=10, anchor="ne")
+        except Exception:
+            pass
+
+        # 恢复 f1 内被隐藏的部分（保留 card）
+        try:
+            self.lbl_time.pack(anchor="w")
+        except Exception:
+            pass
+        try:
+            self.progress.pack(fill="x", pady=(4, 0))
+        except Exception:
+            pass
+        try:
+            self._ctl.pack(pady=(10, 6))
+        except Exception:
+            pass
+        try:
+            self._vol_row.pack(fill="x", pady=(0, 10))
+        except Exception:
+            pass
+        if getattr(self, "_lyrics_appearance_visible", False):
+            try:
+                self.ap_container.pack(fill="x")
+            except Exception:
+                pass
+
+        # 强制重绘 head 里的 Canvas 按钮
+        try:
+            self._update_custom_widgets(self.head)
+        except Exception:
+            pass
+
+        # 恢复几何
+        try:
+            geo = self._compact_saved.get("geometry", "500x365")
+            self.panel.geometry(geo)
+        except Exception:
+            pass
+
+        try:
+            self._on_tab_changed()
+        except Exception:
+            pass
+        try:
+            self.panel.after(50, self._apply_titlebar_theme)
+        except tk.TclError:
+            pass
+        
+    def _bind_compact_drag(self):
+        self._drag_data = {"x": 0, "y": 0}
+
+        drag_exclude = set()
+        for b in (getattr(self, "_compact_prev", None),
+                  getattr(self, "_compact_play", None),
+                  getattr(self, "_compact_next", None),
+                  getattr(self, "_compact_restore", None),
+                  getattr(self, "_compact_ctl", None)):
+            if b is not None:
+                drag_exclude.add(b)
+
+        def on_drag(e):
+            if not self._compact_mode:
+                return
+            dx = e.x_root - self._drag_data["x"]
+            dy = e.y_root - self._drag_data["y"]
+            x = self.panel.winfo_x() + dx
+            y = self.panel.winfo_y() + dy
+            self.panel.geometry(f"+{x}+{y}")
+            self._drag_data["x"] = e.x_root
+            self._drag_data["y"] = e.y_root
+
+        def on_release(_e):
+            try:
+                self.panel.unbind_all("<B1-Motion>")
+                self.panel.unbind_all("<ButtonRelease-1>")
+            except tk.TclError:
+                pass
+
+        def on_press(e):
+            if not self._compact_mode:
+                return
+            self._drag_data["x"] = e.x_root
+            self._drag_data["y"] = e.y_root
+            # 按下时全局捕获 Motion / Release，
+            # 这样即使鼠标移出按下时所在的控件，拖拽也不会中断
+            try:
+                self.panel.bind_all("<B1-Motion>", on_drag)
+                self.panel.bind_all("<ButtonRelease-1>", on_release)
+            except tk.TclError:
+                pass
+
+        def walk(w):
+            if w in drag_exclude:
+                return
+            try:
+                w.bind("<Button-1>", on_press, add="+")
+            except tk.TclError:
+                pass
+            for c in w.winfo_children():
+                walk(c)
+
+        if self._compact_root is not None:
+            walk(self._compact_root)
+            try:
+                self.panel.bind("<Button-1>", on_press, add="+")
+            except tk.TclError:
+                pass
