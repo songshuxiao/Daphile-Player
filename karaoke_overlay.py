@@ -238,7 +238,24 @@ class KaraokeOverlay:
 
         self.root = tk.Tk()
         self.root.title("LMS Karaoke")
-        self.root.geometry(f"{cfg.OVERLAY_W}x{cfg.OVERLAY_H}+{cfg.OVERLAY_X}+{cfg.OVERLAY_Y}")
+
+        # ★ 计算浮窗位置：首次启动居中靠下（高于任务栏），否则用记忆位置
+        try:
+            ox = int(getattr(cfg, "OVERLAY_X", -1))
+            oy = int(getattr(cfg, "OVERLAY_Y", -1))
+        except (TypeError, ValueError):
+            ox, oy = -1, -1
+        if ox < 0 or oy < 0:
+            ox, oy = self._compute_default_position(
+                cfg.OVERLAY_W, cfg.OVERLAY_H)
+            try:
+                cfg.OVERLAY_X = ox
+                cfg.OVERLAY_Y = oy
+            except Exception:
+                pass
+
+        self.root.geometry(
+            f"{cfg.OVERLAY_W}x{cfg.OVERLAY_H}+{ox}+{oy}")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=cfg.COLOR_KEY)
@@ -513,3 +530,40 @@ class KaraokeOverlay:
         
     def run(self):
         self.root.mainloop()
+        
+    def _compute_default_position(self, w, h):
+        """首次启动浮窗位置：水平居中，垂直位于任务栏上方。"""
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+        except tk.TclError:
+            sw, sh = 1920, 1080
+
+        # 水平居中
+        x = max(0, (sw - w) // 2)
+
+        # 距屏幕底部 = 任务栏高度 + 边距
+        taskbar_h = self._get_taskbar_height(sh)
+        margin = 30
+        y = max(0, sh - taskbar_h - h - margin)
+        return x, y
+
+    @staticmethod
+    def _get_taskbar_height(screen_h):
+        """Windows：通过工作区推算任务栏高度；
+           其它平台按 40px 预留。"""
+        try:
+            import ctypes
+            class _RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long),
+                            ("top", ctypes.c_long),
+                            ("right", ctypes.c_long),
+                            ("bottom", ctypes.c_long)]
+            rect = _RECT()
+            # SPI_GETWORKAREA = 0x0030，返回桌面可用工作区
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(rect), 0):
+                return max(0, screen_h - rect.bottom)
+        except Exception:
+            pass
+        return 40        

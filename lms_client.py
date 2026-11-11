@@ -263,7 +263,33 @@ class LmsClient:
         """最终兜底：button 命令"""
         self.command(["button", "jump_fwd" if step > 0 else "jump_rew"])
         print("[切歌] ✓ button 兜底完成")
+    # ---------- 严格按队列顺序切歌（用于收藏列表等）----------
+    def next_track_queue(self):
+        self._jump_queue(+1)
 
+    def prev_track_queue(self):
+        self._jump_queue(-1)
+
+    def _jump_queue(self, step):
+        """严格按 LMS 队列顺序上/下一曲（循环），不做同专辑/同歌手优选。"""
+        try:
+            st = self.get_status()
+            queue = st.get("queue", []) or []
+            cur_pos = st.get("cur_index", -1)
+            if not queue or cur_pos < 0:
+                self._button_step(step)
+                return
+            new_pos = (cur_pos + step) % len(queue)
+            self.command(["playlist", "index", str(new_pos)])
+            print(f"[切歌队列] {'下一曲' if step > 0 else '上一曲'} → "
+                  f"第 {new_pos + 1}/{len(queue)} 首")
+        except Exception as e:
+            print(f"[切歌队列] 异常: {e}，button 兜底")
+            try:
+                self._button_step(step)
+            except Exception as e2:
+                print(f"[切歌队列] button 兜底也失败: {e2}")
+                
     # ---------- 音乐库浏览 ----------
     def browse_artists(self):
         res = self.command(["artists", 0, 500], player="-")
@@ -458,6 +484,32 @@ class LmsClient:
             print(f"[播放] 兜底失败: {e}")
             self._play_single(track_id)
 
+    def play_playlist(self, track_ids, start_index=0):
+        """按 track_ids 顺序加载整张歌单到 LMS 队列，并从 start_index 开始播放。"""
+        track_ids = [str(x) for x in (track_ids or []) if x]
+        if not track_ids:
+            return False
+        try:
+            self.command(["playlistcontrol", "cmd:load",
+                          f"track_id:{track_ids[0]}"])
+        except Exception as e:
+            print(f"[歌单] 加载首曲失败: {e}")
+            return False
+        for tid in track_ids[1:]:
+            try:
+                self.command(["playlistcontrol", "cmd:add",
+                              f"track_id:{tid}"])
+            except Exception as e:
+                print(f"[歌单] 追加 {tid} 失败: {e}")
+        time.sleep(0.4)
+        try:
+            idx = max(0, min(int(start_index), len(track_ids) - 1))
+            self.command(["playlist", "index", str(idx)])
+        except Exception as e:
+            print(f"[歌单] 跳转失败: {e}")
+            return False
+        return True
+    
     def _play_single(self, track_id):
         """最终兜底：只加载单曲"""
         try:

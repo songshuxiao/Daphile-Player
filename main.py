@@ -462,6 +462,14 @@ def _handle_daphile_shutdown(cfg, overlay, panel):
     if not result:
         print("[关机] 用户取消重连，退出程序")
         try:
+            panel.save_position()
+        except Exception:
+            pass
+        try:
+            cfg.save()
+        except Exception:
+            pass
+        try:
             overlay.root.destroy()
         except tk.TclError:
             pass
@@ -493,7 +501,7 @@ def _handle_daphile_shutdown(cfg, overlay, panel):
     panel.reconnect(
         new_lms, new_fetcher,
         players[0][1] if players else "",
-        f"服务器: {host}:{port}")
+        f"{host}:{port}")
 
     print("[关机] 重连成功，主界面已恢复")
 
@@ -550,7 +558,7 @@ def main():
     panel = ControlPanel(lms, overlay, fetcher, cfg)
     _apply_icon(panel.panel)
     panel.player_name = players[0][1] if players else ""
-    panel.lbl_server.config(text=f"服务器: {host}:{port}")
+    panel.lbl_server.config(text=f"{host}:{port}")
 
     panel.on_daphile_shutdown = lambda: _handle_daphile_shutdown(
         cfg, overlay, panel)
@@ -558,6 +566,10 @@ def main():
     def on_close():
         try:
             cfg.OVERLAY_X, cfg.OVERLAY_Y = overlay.get_position()
+        except Exception:
+            pass
+        try:
+            panel.save_position()
         except Exception:
             pass
         cfg.save()

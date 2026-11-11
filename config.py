@@ -35,8 +35,13 @@ class Config:
     PLAYER_MAC = ""
     POLL_INTERVAL = 0.2
 
-    OVERLAY_X, OVERLAY_Y = 100, 620
-    OVERLAY_W, OVERLAY_H = 980, 130
+    # 歌词浮窗位置：-1 表示首次启动自动计算（居中靠下，高于任务栏）
+    OVERLAY_X, OVERLAY_Y = -1, -1
+    # 高度加大到 160：30pt 主行 + 翻译行两行显示宽松，不重叠
+    OVERLAY_W, OVERLAY_H = 980, 160
+    
+    # 主面板位置（-1 表示未设置，首次启动居中显示）
+    PANEL_X, PANEL_Y = -1, -1    
     FONT_FAMILY = "Microsoft YaHei UI"
     FONT_SIZE = 30
 
@@ -57,6 +62,13 @@ class Config:
     LAST_IP  = ""    # 上次成功/手动输入的 IP，便于下次预填
     # 更新检查
     AUTO_CHECK_UPDATE = True    # 启动时是否自动检查更新
+    # —— 收藏 / 歌单 ——
+    # 按设备主机 MAC 分组，切换设备时各自独立，换回原设备仍可用
+    # FAVORITES = {"mac": [{"id", "title", "artist", "album"}, ...], ...}
+    # PLAYLISTS = {"mac": [{"name", "tracks": [...]}, ...], ...}
+    FAVORITES = {}
+    PLAYLISTS = {}
+
     # 键盘步进（可在设置面板调整）
     SEEK_STEP = 5    # 左右键 seek 步进（秒），默认 5
     VOL_STEP  = 2    # 上下键音量步进（%），默认 2
@@ -64,10 +76,12 @@ class Config:
     _PERSIST_KEYS = ("COLOR_ACTIVE", "COLOR_IDLE", "COLOR_KEY", "COLOR_STROKE",
                      "FONT_FAMILY", "FONT_SIZE",
                      "OVERLAY_X", "OVERLAY_Y", "OVERLAY_W", "OVERLAY_H",
+                     "PANEL_X", "PANEL_Y",
                      "OVERLAY_VISIBLE","DARK_MODE",
                      "HOST_MAC", "LAST_IP",
                      "AUTO_CHECK_UPDATE",
-                     "SEEK_STEP", "VOL_STEP")
+                     "SEEK_STEP", "VOL_STEP",
+                     "FAVORITES", "PLAYLISTS")
 
     def __init__(self):
         for k in list(self._PERSIST_KEYS) + \
