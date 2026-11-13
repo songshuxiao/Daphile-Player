@@ -582,7 +582,8 @@ def main():
     overlay.root.protocol("WM_DELETE_WINDOW", on_close)
     panel.panel.protocol("WM_DELETE_WINDOW", on_close)
 
-    overlay.show()
+    # ★ 启动时不主动显示浮窗（避免出现一块空白歌词条）
+    #   有播放内容时由 _ui_tick 自动显示，或用户点击 ♩ 手动切换
     overlay.run()
 
 

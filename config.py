@@ -41,7 +41,14 @@ class Config:
     OVERLAY_W, OVERLAY_H = 980, 160
     
     # 主面板位置（-1 表示未设置，首次启动居中显示）
-    PANEL_X, PANEL_Y = -1, -1    
+    PANEL_X, PANEL_Y = -1, -1
+    # ★ 主面板尺寸 + 用户调整标志
+    PANEL_W, PANEL_H = 500, 399
+    PANEL_USER_RESIZED = False
+    # ★ 播放 tab 独立高度（不受其他 tab 调整影响）
+    PANEL_H_PLAY = 364           # 330 + TAB_BAR_H
+    PLAY_TAB_RESIZED = False
+
     FONT_FAMILY = "Microsoft YaHei UI"
     FONT_SIZE = 30
 
@@ -68,6 +75,11 @@ class Config:
     # PLAYLISTS = {"mac": [{"name", "tracks": [...]}, ...], ...}
     FAVORITES = {}
     PLAYLISTS = {}
+    # ★ 封面 URL 缓存（按主机 MAC 分组，避免跨设备串号）
+    #   ALBUM_COVER_URLS = {"host_mac": {"album_id": "url"}}
+    #   TRACK_COVER_URLS = {"host_mac": {"c:<coverid>" 或 "t:<trackid>": "url"}}
+    ALBUM_COVER_URLS = {}
+    TRACK_COVER_URLS = {}
 
     # 键盘步进（可在设置面板调整）
     SEEK_STEP = 5    # 左右键 seek 步进（秒），默认 5
@@ -77,6 +89,8 @@ class Config:
                      "FONT_FAMILY", "FONT_SIZE",
                      "OVERLAY_X", "OVERLAY_Y", "OVERLAY_W", "OVERLAY_H",
                      "PANEL_X", "PANEL_Y",
+                     "PANEL_W", "PANEL_H", "PANEL_USER_RESIZED",
+                     "PANEL_H_PLAY", "PLAY_TAB_RESIZED",
                      "OVERLAY_VISIBLE","DARK_MODE",
                      "HOST_MAC", "LAST_IP",
                      "AUTO_CHECK_UPDATE",
