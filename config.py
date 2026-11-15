@@ -46,7 +46,7 @@ class Config:
     PANEL_W, PANEL_H = 500, 399
     PANEL_USER_RESIZED = False
     # ★ 播放 tab 独立高度（不受其他 tab 调整影响）
-    PANEL_H_PLAY = 364           # 330 + TAB_BAR_H
+    PANEL_H_PLAY = 354          
     PLAY_TAB_RESIZED = False
 
     FONT_FAMILY = "Microsoft YaHei UI"
@@ -57,6 +57,12 @@ class Config:
     COLOR_KEY    = "#010204"
     COLOR_STROKE = "#B8B8C4"
     OVERLAY_VISIBLE = True      # 桌面歌词浮窗是否显示（持久化）
+    # ★ 主题色：空字符串 = 跟随深色/浅色模式默认
+    #   · 深色模式默认 #5A5AE0，浅色模式默认 #4A4AE0
+    #   · 用户选择后固定使用用户色（切换深浅模式不再变）
+    ACCENT_COLOR = ""
+    # ★ 新增：音量条是否显示（默认隐藏；持久化到 user-config.json）
+    VOLUME_SLIDER_VISIBLE = False
 
     # ★ 新增：深色模式
     DARK_MODE = True
@@ -85,13 +91,14 @@ class Config:
     SEEK_STEP = 5    # 左右键 seek 步进（秒），默认 5
     VOL_STEP  = 2    # 上下键音量步进（%），默认 2
 
-    _PERSIST_KEYS = ("COLOR_ACTIVE", "COLOR_IDLE", "COLOR_KEY", "COLOR_STROKE",
+    _PERSIST_KEYS = ("COLOR_ACTIVE", "COLOR_IDLE", "COLOR_KEY","ACCENT_COLOR","COLOR_STROKE",
                      "FONT_FAMILY", "FONT_SIZE",
                      "OVERLAY_X", "OVERLAY_Y", "OVERLAY_W", "OVERLAY_H",
                      "PANEL_X", "PANEL_Y",
                      "PANEL_W", "PANEL_H", "PANEL_USER_RESIZED",
                      "PANEL_H_PLAY", "PLAY_TAB_RESIZED",
-                     "OVERLAY_VISIBLE","DARK_MODE",
+                     "OVERLAY_VISIBLE", "VOLUME_SLIDER_VISIBLE",   # ★ 新增
+                     "DARK_MODE",
                      "HOST_MAC", "LAST_IP",
                      "AUTO_CHECK_UPDATE",
                      "SEEK_STEP", "VOL_STEP",

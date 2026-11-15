@@ -277,6 +277,14 @@ class KaraokeOverlay:
             
         self.root.bind("<Configure>", lambda e: self._render())
 
+        # ★ 置顶守护：定时强制把浮窗推回 topmost 层，
+        #   避免 hide/show 后或其它应用提升窗口时被覆盖。
+        self._topmost_stop = False
+        try:
+            self.root.after(1000, self._keep_topmost)
+        except tk.TclError:
+            pass
+
     def _bind_drag(self, widget):
         d = {"x": 0, "y": 0}
         def on_press(e):
@@ -291,6 +299,59 @@ class KaraokeOverlay:
         menu.add_command(label="关闭歌词浮窗", command=self.hide)
         widget.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
 
+    # ---------- 置顶守护 ----------
+    def _force_topmost(self):
+        """立即强制把浮窗置于所有非 topmost 窗口之上。
+           · Tk 层：attributes("-topmost", True) —— 幂等
+           · Windows 原生层：SetWindowPos(HWND_TOPMOST,
+             SWP_NOACTIVATE) —— 不抢焦点，真正抢占 Z 序顶端
+        """
+        if not self.is_visible():
+            return
+        try:
+            self.root.attributes("-topmost", True)
+        except tk.TclError:
+            return
+
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+        except ImportError:
+            return
+
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                hwnd = self.root.winfo_id()
+            if not hwnd:
+                return
+            HWND_TOPMOST   = -1
+            SWP_NOSIZE     = 0x0001
+            SWP_NOMOVE     = 0x0002
+            SWP_NOACTIVATE = 0x0010
+            SWP_SHOWWINDOW = 0x0040
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE
+                | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        except Exception:
+            pass
+
+    def _keep_topmost(self):
+        """每 1.5 秒检查一次，确保浮窗始终在 topmost 层。
+           窗口隐藏时跳过（withdraw 后 winfo_ismapped 为 False）。"""
+        if getattr(self, "_topmost_stop", False):
+            return
+        try:
+            self._force_topmost()
+        except Exception:
+            pass
+        try:
+            self.root.after(1500, self._keep_topmost)
+        except tk.TclError:
+            pass
+        
     # ---------- 对外接口 ----------
     def set_line(self, text, next_text="", title="", trans_text=""):
         self._line = text
@@ -518,6 +579,11 @@ class KaraokeOverlay:
 
     def show(self):
         self.root.deiconify()
+        # ★ 立即重新施加置顶（deiconify 后 Windows 可能重置过层级）
+        try:
+            self.root.after(10, self._force_topmost)
+        except tk.TclError:
+            pass
 
     def hide(self):
         self.root.withdraw()

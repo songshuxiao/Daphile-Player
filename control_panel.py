@@ -23,13 +23,13 @@ from io import BytesIO
 from lrc_parser import LrcParser
 
 try:
-    from PIL import Image, ImageDraw, ImageTk
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
 
 
-APP_VERSION = "v9.0.0"
+APP_VERSION = "v10.0.0"
 APP_REPO = "songshuxiao/Daphile-Player"
 GITHUB_URL = f"https://github.com/{APP_REPO}"
 RELEASES_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
@@ -39,6 +39,36 @@ DOWNLOAD_URL = "https://cloud.szfx.top/Windows/235.html"
 def _resource_path(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
+
+def _hex_to_rgb(h):
+    h = (h or "#000000").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    try:
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return (0, 0, 0)
+
+
+def _rgb_to_hex(rgb):
+    r, g, b = [max(0, min(255, int(round(x)))) for x in rgb]
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _mix_color(c1, c2, ratio):
+    """把 c1 与 c2 线性混合：ratio=0 → c1，ratio=1 → c2"""
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r2, g2, b2 = _hex_to_rgb(c2)
+    return _rgb_to_hex((
+        r1 * (1 - ratio) + r2 * ratio,
+        g1 * (1 - ratio) + g2 * ratio,
+        b1 * (1 - ratio) + b2 * ratio,
+    ))
+
+
+def _lighten(color, amount=0.25):
+    """向白色混合"""
+    return _mix_color(color, "#FFFFFF", amount)
 
 def apply_dark_titlebar(window, dark=True, bg_color=None):
     """Windows 10 build 17763+ / Windows 11：把 Toplevel 的标题栏设为深色。
@@ -221,8 +251,9 @@ class CanvasSlider(tk.Canvas):
         self._canvas_h = height
         self._dragging = False
         self._hover = False
+        self._redraw_pending = False          # ★ 新增：重绘是否已排队
 
-        self.bind("<Configure>", lambda e: self._redraw())
+        self.bind("<Configure>", lambda e: self._schedule_redraw())   # ★ 改
         self.bind("<Button-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
@@ -242,7 +273,7 @@ class CanvasSlider(tk.Canvas):
         if abs(v - self._value) < 1e-6:
             return
         self._value = v
-        self._redraw()
+        self._schedule_redraw()               # ★
 
     def config(self, *args, **kwargs):
         if "to" in kwargs:
@@ -264,7 +295,19 @@ class CanvasSlider(tk.Canvas):
 
     configure = config
 
+    def _schedule_redraw(self):
+        """合并高频重绘：短时间内多次 set()/拖动/Configure
+           只会在 idle 时真正重画一次，避免 thumb 残影。"""
+        if self._redraw_pending:
+            return
+        self._redraw_pending = True
+        try:
+            self.after_idle(self._redraw)
+        except tk.TclError:
+            self._redraw_pending = False
+
     def _redraw(self):
+        self._redraw_pending = False          # ★ 新增：首行重置
         self.delete("all")
         w = self.winfo_width()
         if w < 10:
@@ -319,7 +362,7 @@ class CanvasSlider(tk.Canvas):
         if abs(v - self._value) < 1e-6:
             return
         self._value = v
-        self._redraw()
+        self._schedule_redraw()               # ★
         if self._command:
             try:
                 self._command(str(v))
@@ -339,17 +382,17 @@ class CanvasSlider(tk.Canvas):
     def _on_release(self, e):
         was_dragging = self._dragging
         self._dragging = False
-        self._redraw()
+        self._schedule_redraw()               # ★
         if was_dragging and callable(self._on_drag_end):
             self._on_drag_end()
 
     def _on_enter(self, e):
         self._hover = True
-        self._redraw()
+        self._schedule_redraw()               # ★
 
     def _on_leave(self, e):
         self._hover = False
-        self._redraw()
+        self._schedule_redraw()               # ★
 
     def _update_theme(self, panel):
         self.configure(bg=panel.BG)
@@ -357,8 +400,32 @@ class CanvasSlider(tk.Canvas):
         self._fill = panel.ACCENT
         self._thumb = panel.ACCENT
         self._thumb_hover = "#7A7AFF"
-        self._redraw()
+        self._schedule_redraw()               # ★
 
+class _TimeLabel(tk.Label):
+    """播放时间显示 Label（兼容层）。
+       外部仍调用 self.lbl_time.config(text="cur / dur")；
+       内部自动拆分为「当前时间（本身）」+「总时长（on_dur 回调）」。"""
+
+    def __init__(self, master, on_dur=None, **kw):
+        super().__init__(master, **kw)
+        self._on_dur = on_dur
+
+    def config(self, cnf=None, **kwargs):
+        text = kwargs.get("text")
+        if isinstance(text, str) and " / " in text:
+            cur, dur = text.split(" / ", 1)
+            kwargs["text"] = cur
+            if self._on_dur:
+                try:
+                    self._on_dur(dur)
+                except Exception:
+                    pass
+        if cnf is not None:
+            return super().config(cnf, **kwargs)
+        return super().config(**kwargs)
+
+    configure = config
 
 class ControlPanel:
 
@@ -370,16 +437,12 @@ class ControlPanel:
 
         if getattr(self.cfg, "DARK_MODE", True):
             self.BG = "#15151E"; self.CARD = "#20202E"; self.FIELD = "#1A1A24"
-            self.FG = "#E8E8F0"; self.DIM = "#9A9AB0"; self.SEL_BG = "#3D3D5C"
-            self.ACCENT = "#5A5AE0"
-            self.HOVER_BG = "#3D3D5C"
-            self.HOVER_ACCENT = "#7A7AFF"
+            self.FG = "#E8E8F0"; self.DIM = "#9A9AB0"
         else:
             self.BG = "#F0F2F5"; self.CARD = "#FFFFFF"; self.FIELD = "#FFFFFF"
-            self.FG = "#1A1A24"; self.DIM = "#5A5A6A"; self.SEL_BG = "#E0E0E8"
-            self.ACCENT = "#4A4AE0"
-            self.HOVER_BG = "#E0E0E8"
-            self.HOVER_ACCENT = "#7A7AFF"
+            self.FG = "#1A1A24"; self.DIM = "#5A5A6A"
+        # ★ ACCENT / HOVER_ACCENT / SEL_BG / HOVER_BG 统一由主题色计算
+        self._refresh_accent_palette()
 
         self.track_info = {}
         self.song_pos = 0.0
@@ -564,9 +627,97 @@ class ControlPanel:
             self.panel.after(500, self._enable_resize_tracking)
         except tk.TclError:
             pass
-        
+
+    def _set_dur_time(self, text):
+        """由 _TimeLabel 拆分回调触发，更新右侧总时长 Label。"""
+        try:
+            if getattr(self, "lbl_time_dur", None) is not None:
+                self.lbl_time_dur.config(text=text)
+        except tk.TclError:
+            pass        
+    
+    # ========= 音量条显隐统一入口 =========
+    def _set_volume_bar_visible(self, visible, persist=False):
+        """设置音量条显隐 + pack/forget + 窗口高度自适应。
+           persist=True 才写入 cfg（用户手动操作），
+           滚轮临时展开用 persist=False 不污染用户偏好。"""
+        if visible == self._volume_slider_visible:
+            return
+        self._volume_slider_visible = visible
+
+        if visible:
+            self._vol_row.pack(fill="x", pady=(6, 10))
+        else:
+            self._vol_row.pack_forget()
+
+        if persist:
+            try:
+                self.cfg.VOLUME_SLIDER_VISIBLE = visible
+                self.cfg.save()
+            except Exception as e:
+                print(f"[cfg] 音量条可见性保存失败: {e}")
+
+        # 仅播放 tab 下才调整窗口高度
+        try:
+            cur = self.nb.index(self.nb.select())
+        except Exception:
+            cur = -1
+        if cur != 0:
+            return
+        try:
+            self.panel.update_idletasks()
+            if getattr(self, "_play_tab_resized", False):
+                try:
+                    base_h = int(getattr(self.cfg, "PANEL_H_PLAY", 0) or 0)
+                except (TypeError, ValueError):
+                    base_h = 0
+                if base_h < 200:
+                    base_h = 320 + self.TAB_BAR_H
+            else:
+                base_h = 320 + self.TAB_BAR_H
+            new_h = base_h + (38 if visible else 0)
+            self._set_panel_geometry(f"{self.panel.winfo_width()}x{new_h}")
+        except Exception:
+            pass
+
+    def _toggle_volume_slider(self):
+        """用户点击头部 🔊 按钮：切换显隐并持久化。
+           用户操作优先 —— 清掉任何"滚轮临时展开"状态和定时器。"""
+        # 若正处于滚轮临时展开 → 视为用户确认关闭
+        self._vol_auto_shown = False
+        self._cancel_vol_auto_hide()
+        self._set_volume_bar_visible(
+            not self._volume_slider_visible, persist=True)
+        return "break"
+
+    # ========= 滚轮临时展开用的定时器 =========
+    def _cancel_vol_auto_hide(self):
+        if getattr(self, "_vol_auto_hide_after_id", None):
+            try:
+                self.panel.after_cancel(self._vol_auto_hide_after_id)
+            except tk.TclError:
+                pass
+            self._vol_auto_hide_after_id = None
+
+    def _schedule_vol_auto_hide(self):
+        self._cancel_vol_auto_hide()
+        try:
+            self._vol_auto_hide_after_id = self.panel.after(
+                2000, self._vol_auto_hide)
+        except tk.TclError:
+            self._vol_auto_hide_after_id = None
+
+    def _vol_auto_hide(self):
+        """2 秒未滚轮 → 若当前是滚轮临时展开，则自动收起。"""
+        self._vol_auto_hide_after_id = None
+        if not self._vol_auto_shown:
+            return
+        self._vol_auto_shown = False
+        if self._volume_slider_visible:
+            self._set_volume_bar_visible(False, persist=False)
+            
     def _on_mousewheel_volume(self, event):
-        """滚轮控制音量，幅度与键盘上下键一致（VOL_STEP）。
+        """滚轮控制音量；若音量条当前隐藏，自动临时展开，2 秒后自动收起。
            仅「播放中」标签页与简洁模式生效；输入类控件保留自身滚轮行为。"""
         try:
             delta = event.delta
@@ -576,20 +727,16 @@ class ControlPanel:
             return None
 
         if self._compact_mode:
-            # 简洁模式：无其他可滚动控件，直接处理
             pass
         else:
-            # 完整模式：仅「播放中」标签页生效
             try:
                 if self.nb.index(self.nb.select()) != 0:
                     return None
             except (tk.TclError, ValueError):
                 return None
-            # Spinbox / Entry / Combobox / Text 保留自身滚轮行为
             if self._is_input_widget(event.widget):
                 return None
 
-        # 向上滚 = 音量 +step；向下滚 = 音量 -step
         steps = int(delta / 120)
         if steps == 0:
             steps = 1 if delta > 0 else -1
@@ -600,6 +747,16 @@ class ControlPanel:
         except (TypeError, ValueError, tk.TclError):
             cur_vol = 50
         new_vol = max(0, min(100, cur_vol + steps * step))
+
+        # ★ 音量条隐藏时 → 滚轮触发临时展开（不写入 cfg）
+        if not self._volume_slider_visible:
+            self._vol_auto_shown = True
+            self._set_volume_bar_visible(True, persist=False)
+        # ★ 仅对「滚轮临时展开」状态启动 2 秒自动收起；
+        #   用户手动开启的音量条不受影响，永远保持显示。
+        if self._vol_auto_shown:
+            self._schedule_vol_auto_hide()
+
         if new_vol == cur_vol:
             return "break"
 
@@ -680,6 +837,12 @@ class ControlPanel:
                 self.progress.set(pos)
                 self.song_pos = pos
                 self._last_seek_ts = time.time()
+                self._last_seek_target = pos
+                self._seek_retried = False
+                try:
+                    self._refresh_lyrics_now()
+                except Exception:
+                    pass
 
                 def work_l(p=pos):
                     try:
@@ -694,6 +857,12 @@ class ControlPanel:
                 self.progress.set(pos)
                 self.song_pos = pos
                 self._last_seek_ts = time.time()
+                self._last_seek_target = pos
+                self._seek_retried = False
+                try:
+                    self._refresh_lyrics_now()
+                except Exception:
+                    pass
 
                 def work_r(p=pos):
                     try:
@@ -931,6 +1100,30 @@ class ControlPanel:
                 self._lib_set_status(f"正在播放: {tname}")
         return "break"
 
+    # ================= 主题色调色板 =================
+    def _resolve_accent(self):
+        """解析当前应使用的主题色：
+           · 用户设置过 ACCENT_COLOR → 用用户色
+           · 未设置 → 深色 #5A5AE0 / 浅色 #4A4AE0（旧默认）"""
+        user = (getattr(self.cfg, "ACCENT_COLOR", "") or "").strip()
+        if user and len(user.lstrip("#")) in (3, 6):
+            return user
+        return "#5A5AE0" if self.cfg.DARK_MODE else "#4A4AE0"
+
+    def _refresh_accent_palette(self):
+        """根据主题色与当前深浅模式，重算 ACCENT / HOVER_ACCENT / SEL_BG。"""
+        accent = self._resolve_accent()
+        self.ACCENT = accent
+        if self.cfg.DARK_MODE:
+            self.HOVER_ACCENT = _lighten(accent, 0.22)
+            # 选中辅助背景：约 28% ACCENT + 72% CARD，偏暗
+            self.SEL_BG = _mix_color(accent, self.CARD, 0.72)
+        else:
+            self.HOVER_ACCENT = _lighten(accent, 0.18)
+            # 浅色下约 18% ACCENT + 82% 白，很柔和
+            self.SEL_BG = _mix_color(accent, "#FFFFFF", 0.82)
+        self.HOVER_BG = self.SEL_BG
+
     # ================= 样式 =================
     def _build_style(self):
         style = ttk.Style(self.panel)
@@ -982,15 +1175,43 @@ class ControlPanel:
                   padding=[("selected", (17, 8)), ("!selected", (15, 6))],
                   expand=[("selected", [1, 0, 1, 0])])
 
-        style.configure("TCombobox", fieldbackground=self.FIELD,
-                        foreground=self.FG, background=self.CARD,
-                        arrowcolor=self.FG)
+        # ★ 扁平化 Combobox：clam 主题默认的 3D 浮雕边框
+        #   （上左亮线 + 下右暗线）在深色卡片里非常突兀。
+        #   把 border/light/dark 三种颜色全部改成字段底色，
+        #   并加 padding，让字体选择框看起来像"无边框的纯色输入区"。
+        style.configure("TCombobox",
+                        fieldbackground=self.FIELD,
+                        foreground=self.FG,
+                        background=self.FIELD,   # 箭头区域 = 字段色，避免色块割裂
+                        arrowcolor=self.FG,
+                        bordercolor=self.FIELD,  # 边框色 = 字段底色（视觉消失）
+                        lightcolor=self.FIELD,   # 抹掉上/左高光
+                        darkcolor=self.FIELD,    # 抹掉下/右阴影
+                        borderwidth=0,
+                        relief="flat",
+                        padding=(6, 3),          # 文字与边框留白
+                        arrowsize=12)            # 箭头略收，更精致
         style.map("TCombobox",
                   fieldbackground=[("readonly", self.FIELD),
-                                   ("active", self.FIELD)],
-                  foreground=[("readonly", self.FG)],
+                                   ("active", self.FIELD),
+                                   ("focus", self.FIELD)],
+                  foreground=[("readonly", self.FG),
+                              ("focus", self.FG)],
+                  background=[("readonly", self.FIELD),
+                              ("active", self.FIELD),
+                              ("focus", self.FIELD)],
                   selectbackground=[("readonly", self.FIELD)],
-                  selectforeground=[("readonly", self.FG)])
+                  selectforeground=[("readonly", self.FG)],
+                  bordercolor=[("readonly", self.FIELD),
+                               ("focus", self.FIELD),
+                               ("active", self.FIELD)],
+                  lightcolor=[("readonly", self.FIELD),
+                              ("focus", self.FIELD),
+                              ("active", self.FIELD)],
+                  darkcolor=[("readonly", self.FIELD),
+                             ("focus", self.FIELD),
+                             ("active", self.FIELD)],
+                  arrowcolor=[("active", self.ACCENT)])
 
         style.configure("TEntry", fieldbackground=self.FIELD,
                         foreground=self.FG, insertcolor=self.FG)
@@ -1011,7 +1232,8 @@ class ControlPanel:
 
         # ★ 加深选中背景色：深色模式用紫蓝强调色，浅色模式用深蓝强调色，文字纯白
         # ★ 新增 !focus selected：即使焦点离开某棵树，该树内已选中项依然保持高亮
-        _sel_bg = "#5A5AE0" if self.cfg.DARK_MODE else "#4A4AE0"
+        # ★ 选中行背景 = 当前主题色
+        _sel_bg = self.ACCENT
         style.map("Library.Treeview",
                   background=[("selected", _sel_bg),
                               ("!focus selected", _sel_bg)],
@@ -1113,9 +1335,14 @@ class ControlPanel:
         p.option_add("*TCombobox*Listbox.selectForeground", self.FG)
 
         head = tk.Frame(p, bg=self.BG)
-        head.pack(fill="x", padx=10, pady=(10, 4))
+        head.pack(fill="x", padx=10, pady=(10, 10))
         self.head = head                       # ★ 新增
 
+        # ★ 音量条显隐状态（默认隐藏；沿用上次保存的选择）
+        self._volume_slider_visible = bool(
+            getattr(self.cfg, "VOLUME_SLIDER_VISIBLE", False))
+        self._vol_auto_shown = False        # ★ 当前是否为滚轮临时展开
+        self._vol_auto_hide_after_id = None # ★ 2 秒自动隐藏定时器 ID       
         # ① 先 pack 服务器图标按钮 → 占据最左位置
         self.btn_daphile_settings = self._make_server_button(
             head, self._open_daphile_settings, size=22)
@@ -1158,6 +1385,12 @@ class ControlPanel:
             width=22, height=22, radius=8, icon_style=True)
         self.btn_lyrics.pack(side="right", padx=(0, 6))
 
+        # ★ 新增：音量条显示/隐藏 🔊（位于设置与歌词按钮之间）
+        self.btn_volume_toggle = self._make_round_btn(
+            head, "🔊", self._toggle_volume_slider,
+            width=22, height=22, radius=8, icon_style=True)
+        self.btn_volume_toggle.pack(side="right", padx=(0, 6))
+
         # ★ 设置：改用 PIL 齿轮
         self.btn_settings = self._make_round_btn(
             head, "", self._open_settings_dialog,
@@ -1184,6 +1417,11 @@ class ControlPanel:
             self.btn_lyrics,
             lambda: "隐藏歌词" if self.overlay.is_visible() else "显示歌词")
         self._bind_tooltip(self.btn_compact, "简洁模式")
+        # ★ 新增：音量条显隐 tooltip（文案随状态切换）
+        self._bind_tooltip(
+            self.btn_volume_toggle,
+            lambda: "隐藏音量条" if self._volume_slider_visible else "显示音量条")
+        self._bind_tooltip(self.btn_compact, "简洁模式")            
         # ★ 新增：达菲设置 / 关闭达菲
         self._bind_tooltip(self.btn_daphile_settings, "达菲设置")
         self._bind_tooltip(self.btn_shutdown, "关闭达菲")
@@ -1191,23 +1429,24 @@ class ControlPanel:
         self._bind_tooltip(self.btn_server_web, "LYRION")
         self._bind_tooltip(self.btn_player_icon,
                            lambda: self._player_tooltip_text())
+    
         # ================= TAB 1：正在播放 =================
-        f1 = ttk.Frame(nb, padding=10)
+        f1 = ttk.Frame(nb, padding=(10, 12))  
         nb.add(f1, text="播放")
         self._f1 = f1                          # ★ 新增
 
         card = tk.Frame(f1, bg=self.CARD,
                 highlightbackground=self.SEL_BG,
                 highlightthickness=1)
-        card.pack(fill="x", pady=(0, 8))
+        card.pack(fill="x", pady=(0, 5))
         self._card = card                      # ★ 新增
 
         self.cover_canvas = tk.Canvas(card, width=72, height=72,
                                       bg=self.CARD, highlightthickness=0, bd=0)
-        self.cover_canvas.pack(side="right", padx=(0, 12), pady=10)
+        self.cover_canvas.pack(side="right", padx=(0, 12), pady=8)
 
         info = tk.Frame(card, bg=self.CARD)
-        info.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+        info.pack(side="left", fill="both", expand=True, padx=12, pady=8)
         self._info_widget = info
 
         self.lbl_title = tk.Label(info, text="—", bg=self.CARD, fg=self.FG,
@@ -1239,20 +1478,32 @@ class ControlPanel:
 
         self._draw_default_cover()
 
-        self.lbl_time = tk.Label(f1, text="00:00 / 00:00", bg=self.BG,
-                                 fg=self.DIM, font=("Consolas", 10))
-        self.lbl_time.pack(anchor="w")
+        # ★ 时间行：左=当前时间，右=总时长（贴合进度条上方）
+        time_row = tk.Frame(f1, bg=self.BG)
+        time_row.pack(fill="x", pady=(14, 0))        # 上方留白，紧贴进度条
+
+        self.lbl_time = _TimeLabel(
+            time_row, on_dur=self._set_dur_time,
+            text="00:00", bg=self.BG, fg=self.DIM,
+            font=("Consolas", 10))
+        self.lbl_time.pack(side="left")
+
+        self.lbl_time_dur = tk.Label(
+            time_row, text="00:00", bg=self.BG, fg=self.DIM,
+            font=("Consolas", 10))
+        self.lbl_time_dur.pack(side="right")
 
         self.progress = CanvasSlider(
             f1, from_=0, to=100, value=0,
             bg=self.BG, trough="#0F0F16" if self.cfg.DARK_MODE else "#E0E0E8",
             fill=self.ACCENT, thumb=self.ACCENT, thumb_hover="#7A7AFF",
             height=22, track_height=6, thumb_radius=8,
+            command=self._on_progress_drag,
             on_drag_start=self._seek_start, on_drag_end=self._seek_end)
-        self.progress.pack(fill="x", pady=(4, 0))
+        self.progress.pack(fill="x", pady=(4, 0))     # 时间行与进度条几乎贴合
 
         ctl = tk.Frame(f1, bg=self.BG)
-        ctl.pack(pady=(10, 6))
+        ctl.pack(pady=(10, 6))  
         self._ctl = ctl                        # ★ 新增
 
         self.btn_prev = self._make_play_btn(
@@ -1262,7 +1513,7 @@ class ControlPanel:
 
         self.btn_play = self._make_play_btn(
             ctl, "▶", self._toggle_play,
-            diameter=54, font_size=18, primary=True)
+            diameter=50, font_size=16, primary=True)
         self.btn_play.pack(side="left", padx=8)
 
         self.btn_next = self._make_play_btn(
@@ -1270,10 +1521,9 @@ class ControlPanel:
             diameter=38, font_size=10, primary=False)
         self.btn_next.pack(side="left", padx=8)
 
-        # ★ 音量控制行：喇叭图标 + 百分比 + 滑块
+        # ★ 音量控制行：喇叭图标 + 百分比 + 滑块（默认隐藏，可点头部按钮切换）
         vol_row = tk.Frame(f1, bg=self.BG)
-        vol_row.pack(fill="x", pady=(0, 10))
-        self._vol_row = vol_row                # ★ 新增
+        self._vol_row = vol_row
         tk.Label(vol_row, text="🔊", bg=self.BG, fg=self.DIM,
                  font=("Segoe UI Emoji", 12)).pack(side="left")
         self.lbl_vol_pct = tk.Label(
@@ -1290,6 +1540,10 @@ class ControlPanel:
             on_drag_end=self._on_vol_drag_end)
         self.scl_vol.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
+        # 默认隐藏：只有上次设置为"显示"时才 pack
+        if self._volume_slider_visible:
+            vol_row.pack(fill="x", pady=(6,10))
+
         # ---- 设置项懒创建于独立「设置」对话框中 ----
         # 属性名保持不变，让 _on_font_change / _pick_color /
         # _on_seek_step_change / _toggle_theme 等回调继续复用
@@ -1298,13 +1552,17 @@ class ControlPanel:
         self.ap = None
         self.cmb_font = None
         self.spn_size = None
-        self._swatch_active = None
+        self._swatch_active = None        
+        self._swatch_accent = None        # ★ 主题色 swatch
         self._swatch_idle = None
         self._swatch_stroke = None
+
         self._theme_toggle = None
         self.spn_seek_step = None
         self.spn_vol_step = None
         self.btn_about = None
+        self.btn_reset = None          # ★ 新增
+        self.btn_reset = None          # ★ 新增：恢复默认按钮
         self._settings_win = None
 
         # ================= TAB 2：音乐库 =================
@@ -1669,7 +1927,7 @@ class ControlPanel:
         nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     # ================= 自绘圆角 Tab 栏 =================
-    TAB_BAR_H = 34   # 供 _calc_panel_height 统一引用
+    TAB_BAR_H = 32   # 供 _calc_panel_height 统一引用
 
     def _build_tab_bar(self, parent):
         bar = tk.Frame(parent, bg=self.BG)
@@ -1811,56 +2069,89 @@ class ControlPanel:
             pass
     
     def _sel_highlight_color(self):
-        """与 _build_style 里 Library.Treeview 的 selected 背景色保持一致。"""
-        return "#5A5AE0" if self.cfg.DARK_MODE else "#4A4AE0"
+        """与 _build_style 里 Treeview 的 selected 背景保持一致。"""
+        return self.ACCENT
     
-    def _apply_theme(self):
-        if self.cfg.DARK_MODE:
-            old_colors = {
-                "#F0F2F5": "#15151E", "#FFFFFF": "#20202E",
-                "#1A1A24": "#E8E8F0", "#5A5A6A": "#9A9AB0",
-                "#E0E0E8": "#3D3D5C", "#4A4AE0": "#5A5AE0"
-            }
-            self.BG = "#15151E"; self.CARD = "#20202E"; self.FIELD = "#1A1A24"
-            self.FG = "#E8E8F0"; self.DIM = "#9A9AB0"; self.SEL_BG = "#3D3D5C"
-            self.ACCENT = "#5A5AE0"
-            self.HOVER_BG = "#3D3D5C"
-            self.HOVER_ACCENT = "#7A7AFF"
-        else:
-            old_colors = {
-                "#15151E": "#F0F2F5", "#20202E": "#FFFFFF",
-                "#E8E8F0": "#1A1A24", "#9A9AB0": "#5A5A6A",
-                "#3D3D5C": "#E0E0E8", "#5A5AE0": "#4A4AE0"
-            }
-            self.BG = "#F0F2F5"; self.CARD = "#FFFFFF"; self.FIELD = "#FFFFFF"
-            self.FG = "#1A1A24"; self.DIM = "#5A5A6A"; self.SEL_BG = "#E0E0E8"
-            self.ACCENT = "#4A4AE0"
-            self.HOVER_BG = "#E0E0E8"
-            self.HOVER_ACCENT = "#7A7AFF"
 
+    def _apply_theme(self):
+        # ① 记录所有主题色旧值（用于构建"旧→新"映射）
+        old = {
+            "BG":           self.BG,
+            "CARD":         self.CARD,
+            "FIELD":        self.FIELD,
+            "FG":           self.FG,
+            "DIM":          self.DIM,
+            "SEL_BG":       self.SEL_BG,
+            "ACCENT":       self.ACCENT,
+            "HOVER_BG":     self.HOVER_BG,
+            "HOVER_ACCENT": self.HOVER_ACCENT,
+        }
+
+        # ② 更新基础色（深浅模式负责 BG/CARD/FIELD/FG/DIM）
+        if self.cfg.DARK_MODE:
+            self.BG = "#15151E"; self.CARD = "#20202E"; self.FIELD = "#1A1A24"
+            self.FG = "#E8E8F0"; self.DIM = "#9A9AB0"
+        else:
+            self.BG = "#F0F2F5"; self.CARD = "#FFFFFF"; self.FIELD = "#FFFFFF"
+            self.FG = "#1A1A24"; self.DIM = "#5A5A6A"
+
+        # ③ 重算强调色系（ACCENT / HOVER_ACCENT / SEL_BG / HOVER_BG）
+        #    · 若用户设置过 ACCENT_COLOR → 全部由主题色派生
+        #    · 若未设置 → 回退旧硬编码，保证旧配置升级后视觉完全一致
+        self._refresh_accent_palette()
+
+        # ④ 构建"旧值 → 新值"映射：只包含真正发生变化的颜色
+        #    （key 保留大小写；_recolor_widgets 内部已改为大小写不敏感匹配）
+        old_colors = {}
+        for k, ov in old.items():
+            nv = getattr(self, k, ov)
+            if ov and nv and ov != nv:
+                old_colors[ov] = nv
+
+        # ⑤ 主面板基础刷新
         self.panel.configure(bg=self.BG)
         self._recolor_widgets(self.panel, old_colors)
         self._build_style()
 
-        if hasattr(self, "_toggle_cache"): self._toggle_cache.clear()
-        if hasattr(self, "_circle_cache"): self._circle_cache.clear()
+        # ⑥ 清空所有 PIL 图片缓存
+        #    这些缓存以颜色/尺寸作 key，颜色变了必须清空，才能用新色重绘
+        if hasattr(self, "_toggle_cache"):
+            self._toggle_cache.clear()
+        if hasattr(self, "_circle_cache"):
+            self._circle_cache.clear()
         self._icon_cache.clear()
-        if hasattr(self, "_heart_cache"): self._heart_cache.clear()        
-        if hasattr(self, "_back_icon_cache"): self._back_icon_cache.clear()
+        if hasattr(self, "_heart_cache"):
+            self._heart_cache.clear()
+        if hasattr(self, "_back_icon_cache"):
+            self._back_icon_cache.clear()
         self._ns_grid_panel_h = None
-        if hasattr(self, "_pin_icon_cache"): self._pin_icon_cache.clear()
-        if hasattr(self, "_server_icon_cache"): self._server_icon_cache.clear()
-        if hasattr(self, "_speaker_photo_cache"): self._speaker_photo_cache.clear()
+        if hasattr(self, "_pin_icon_cache"):
+            self._pin_icon_cache.clear()
+        if hasattr(self, "_server_icon_cache"):
+            self._server_icon_cache.clear()
+        if hasattr(self, "_speaker_photo_cache"):
+            self._speaker_photo_cache.clear()
         if hasattr(self, "_lyrion_icon_cache"):
             self._lyrion_icon_cache.clear()
-        
-        if hasattr(self, "_gear_icon_cache"): self._gear_icon_cache.clear()
-        if hasattr(self, "_power_icon_cache"): self._power_icon_cache.clear()
-        if hasattr(self, "_rounded_rect_cache"): self._rounded_rect_cache.clear()
-
+        if hasattr(self, "_gear_icon_cache"):
+            self._gear_icon_cache.clear()
+        if hasattr(self, "_power_icon_cache"):
+            self._power_icon_cache.clear()
+        if hasattr(self, "_rounded_rect_cache"):
+            self._rounded_rect_cache.clear()
+        if hasattr(self, "_menu_icon_cache"):
+            self._menu_icon_cache.clear()
+        if hasattr(self, "_info_icon_cache"):
+            self._info_icon_cache.clear()
+        if hasattr(self, "_pil_font_file_cache"):
+            self._pil_font_file_cache.clear()
+            
+        # ⑦ 自定义 Canvas 控件（Tab 按钮 / 播放按钮 / 圆角按钮 / 开关 / 滑块……）
+        #    逐层回调 _update_theme，让它们用新的 ACCENT 重绘
         self._update_custom_widgets(self.panel)
         self._lib_refresh()
-        
+
+        # ⑧ 原生控件逐项同步（设置对话框内也有一批，需要跟随）
         try:
             if self.spn_size is not None:
                 self.spn_size.config(
@@ -1904,7 +2195,10 @@ class ControlPanel:
                     fg=self.ACCENT if _has_album else self.DIM)
             except Exception:
                 pass
+
             self.lbl_time.config(bg=self.BG, fg=self.DIM)
+            if getattr(self, "lbl_time_dur", None) is not None:
+                self.lbl_time_dur.config(bg=self.BG, fg=self.DIM)            
             self.lbl_server.config(bg=self.BG, fg=self.ACCENT)
             self.lbl_player.config(bg=self.BG, fg=self.ACCENT)
 
@@ -1914,7 +2208,8 @@ class ControlPanel:
             self.lbl_lib.config(bg=self.BG, fg=self.DIM)
         except Exception:
             pass
-        # ★ 卡片描边 / Tab 分隔线：主题切换后同步
+
+        # ⑨ 卡片描边 / Tab 分隔线：主题切换后同步
         try:
             self._card.config(bg=self.CARD,
                               highlightbackground=self.SEL_BG)
@@ -1923,10 +2218,11 @@ class ControlPanel:
         try:
             self._tab_sep.config(bg=self.SEL_BG)
         except Exception:
-            pass        
-        # ★ 修复爱心 Canvas 背景色：
-        #   _recolor_widgets 会把 FIELD(#1A1A24) 误识别为 FG 而互换色值，
-        #   这里显式重设为当前主题的 FIELD 色，覆盖错误映射。
+            pass
+
+        # ⑩ 修复红心 Canvas 背景色
+        #    _recolor_widgets 可能把 FIELD 误识别为 FG 而互换色值，
+        #    这里显式重设为当前主题的 FIELD 色，覆盖错误映射。
         try:
             self.tree_tracks_hearts.config(bg=self.FIELD)
         except Exception:
@@ -1936,7 +2232,7 @@ class ControlPanel:
         except Exception:
             pass
 
-        # 背景色变了，重绘红心（顺带用新主题的高亮色重绘选中行底色）
+        # ⑪ 用新的 ACCENT 重绘红心区（含选中行的高亮底色）
         try:
             self._redraw_hearts(
                 self.tree_tracks, self.tree_tracks_hearts, self._lib_tracks)
@@ -1946,7 +2242,17 @@ class ControlPanel:
             self._redraw_hearts(
                 self.ns_tree, self.ns_tree_hearts, self._ns_tracks)
         except Exception:
-            pass        
+            pass
+
+        # ⑫ 默认封面：中心圆环用 ACCENT 绘制，需跟随主题色重绘
+        #    仅在"当前没有真实封面图"时执行，避免闪回占位图
+        try:
+            if self._cover_photo is None:
+                self._draw_default_cover()
+        except Exception:
+            pass
+
+        # ⑬ 标题栏 + 播放器图标（描边/填充都用 ACCENT）
         try:
             self._apply_titlebar_theme()
         except Exception:
@@ -1957,20 +2263,26 @@ class ControlPanel:
                 self.lbl_player.config(image=new_photo)
                 self.lbl_player.image = new_photo
         except Exception:
-            pass        
-        
-    def _recolor_widgets(self, widget, mapping):
-        try:
-            for prop in ("bg", "fg", "activebackground", "activeforeground", 
-                         "highlightbackground", "highlightcolor", "insertbackground", 
-                         "buttonbackground", "troughcolor"):
-                if prop in widget.keys():
-                    val = widget.cget(prop)
-                    if val in mapping:
-                        widget.configure(**{prop: mapping[val]})
-        except Exception:
             pass
         
+    def _recolor_widgets(self, widget, mapping):
+        if not mapping:
+            return
+        # ★ askcolor 返回小写、配置里多为大写，做大小写不敏感匹配
+        mapping_lower = {k.lower(): v for k, v in mapping.items()}
+        try:
+            for prop in ("bg", "fg", "activebackground", "activeforeground",
+                         "highlightbackground", "highlightcolor",
+                         "insertbackground", "buttonbackground", "troughcolor"):
+                if prop in widget.keys():
+                    val = widget.cget(prop)
+                    if isinstance(val, str):
+                        newv = mapping_lower.get(val.lower())
+                        if newv is not None:
+                            widget.configure(**{prop: newv})
+        except Exception:
+            pass
+
         for child in widget.winfo_children():
             self._recolor_widgets(child, mapping)
 
@@ -2102,8 +2414,11 @@ class ControlPanel:
                     tab_index = -1
 
             if tab_index == 0:
-                # ★ 播放 tab：只写 PANEL_H_PLAY
-                self.cfg.PANEL_H_PLAY = h
+                # ★ 播放 tab：PANEL_H_PLAY 存"不含音量条"的基础高度
+                base_h = h - (38 if self._volume_slider_visible else 0)
+                if base_h < 200:
+                    base_h = 320 + self.TAB_BAR_H
+                self.cfg.PANEL_H_PLAY = base_h
                 self.cfg.PLAY_TAB_RESIZED = True
                 self.cfg.PANEL_X = x
                 self.cfg.PANEL_Y = y
@@ -2167,11 +2482,13 @@ class ControlPanel:
         if cur_tab == 0:
             if self._play_tab_resized:
                 try:
-                    h = int(getattr(self.cfg, "PANEL_H_PLAY", 0) or 0)
+                    base_h = int(getattr(self.cfg, "PANEL_H_PLAY", 0) or 0)
                 except (TypeError, ValueError):
-                    h = 0
-                if h < 200:
-                    h = default_h
+                    base_h = 0
+                if base_h < 200:
+                    base_h = 320 + self.TAB_BAR_H
+                # ★ PANEL_H_PLAY 是"不含音量条"的基础高度
+                h = base_h + (38 if self._volume_slider_visible else 0)
             else:
                 h = default_h
         else:
@@ -2227,9 +2544,12 @@ class ControlPanel:
                 cur_tab = -1
 
             if cur_tab == 0:
-                # 播放 tab：只保存高度到 PANEL_H_PLAY
+                # 播放 tab：只保存高度到 PANEL_H_PLAY（不含音量条）
                 if self._play_tab_resized and h >= 200:
-                    self.cfg.PANEL_H_PLAY = h
+                    base_h = h - (38 if self._volume_slider_visible else 0)
+                    if base_h < 200:
+                        base_h = 320 + self.TAB_BAR_H
+                    self.cfg.PANEL_H_PLAY = base_h
                     self.cfg.PLAY_TAB_RESIZED = True
             else:
                 # 其他 tab：保存宽高到 PANEL_W / PANEL_H
@@ -2254,12 +2574,14 @@ class ControlPanel:
         if cur == 2:
             return (460 if self._ns_view == "list" else 680) + H
         if cur in (3, 4):
-            # ★ 收藏 / 歌单默认高度与专辑网格一致（680 + H）
-            #   若专辑 tab 已实际 fit 过，用更精确的 _ns_grid_panel_h
             if getattr(self, "_ns_grid_panel_h", None):
                 return int(self._ns_grid_panel_h)
             return 680 + H
-        return 330 + H          # 播放页：399 → 364，紧凑
+        # ★ 播放页：基础 314 + H；音量条可见时 +38（22 音量条 + 16 pady）
+        base = 314 + H
+        if getattr(self, "_volume_slider_visible", False):
+            base += 38
+        return base
 
     def _on_tab_changed(self, _e=None):
         # ★ 同步自绘 Tab 按钮的选中状态
@@ -2290,7 +2612,7 @@ class ControlPanel:
         try:
             self.btn_settings.pack_forget()
             self.btn_settings.pack(side="right", padx=(0, 6),
-                                   after=self.btn_lyrics)
+                                   after=self.btn_volume_toggle)
         except tk.TclError:
             pass
 
@@ -2322,18 +2644,15 @@ class ControlPanel:
         if cur == 0:
             if self._play_tab_resized:
                 try:
-                    h = int(getattr(self.cfg, "PANEL_H_PLAY", 0) or 0)
+                    base_h = int(getattr(self.cfg, "PANEL_H_PLAY", 0) or 0)
                 except (TypeError, ValueError):
-                    h = 0
-                if h < 200:
-                    h = self._calc_panel_height()
+                    base_h = 0
+                if base_h < 200:
+                    base_h = 320 + self.TAB_BAR_H
+                h = base_h + (38 if self._volume_slider_visible else 0)
             else:
-                h = self._calc_panel_height()
+                h = self._calc_panel_height()   # 已含音量条高度
             self._set_panel_geometry(f"500x{h}")
-            return
-
-        # ★ 其他 tab：受 _user_resized 影响
-        if self._user_resized:
             return
 
         if cur == 1:
@@ -2502,6 +2821,7 @@ class ControlPanel:
         self._swatch_active = None
         self._swatch_idle = None
         self._swatch_stroke = None
+        self._swatch_accent = None    
         self._theme_toggle = None
         self.spn_seek_step = None
         self.spn_vol_step = None
@@ -2587,26 +2907,137 @@ class ControlPanel:
         tk.Label(r2, text="%", bg=self.CARD, fg=self.DIM,
                  font=("Microsoft YaHei UI", 9)).pack(side="left")
 
-        # ---- 第四行：深色模式 + 关于 ----
+        # ---- 第四行：主题色 + 深色模式 ----
         r3 = tk.Frame(wrap, bg=self.CARD)
         r3.pack(fill="x", padx=8, pady=(0, 4))
 
+        # ★ 主题色 swatch（最左）
+        acc_frame, self._swatch_accent = self._make_color_swatch(
+            r3, "ACCENT_COLOR", "主题色")
+        acc_frame.pack(side="left", padx=(0, 16))
+
+        # ★ 先 pack 文字「深色模式」，让它在切换按钮左侧
+        tk.Label(r3, text="深色模式", bg=self.CARD, fg=self.DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+
+        # ★ 再 pack 切换按钮，落在文字右侧
         self._theme_toggle = self._make_toggle_switch(
             r3, self._toggle_theme,
             initial=bool(getattr(self.cfg, "DARK_MODE", True)),
             width=40, height=20)
-        self._theme_toggle.pack(side="left", padx=(0, 6))
-        tk.Label(r3, text="深色模式", bg=self.CARD, fg=self.DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self._theme_toggle.pack(side="left", padx=(6, 0))
+
+        # ---- 第五行：恢复默认（左） / 关于（右） ----
+        r4 = tk.Frame(wrap, bg=self.CARD)
+        r4.pack(fill="x", padx=8, pady=(4, 0))
+
+        self.btn_reset = self._make_round_btn(
+            r4, "恢复默认", self._reset_all_settings,
+            width=86, height=24, radius=8,
+            btn_bg=self.CARD, font_size=9)
+        self.btn_reset.pack(side="left")
 
         self.btn_about = self._make_round_btn(
-            r3, "ⓘ 关于", self._show_about,
-            width=60, height=22, radius=8)
+            r4, "关于", self._show_about,
+            width=72, height=24, radius=8,
+            icon_kind="info")
         self.btn_about.pack(side="right")
 
         # 同步字体控件初值
         self._sync_font_controls()
+        
+    def _reset_all_settings(self):
+        """恢复所有自定义外观/行为偏好到默认值。
 
+           重置：字体、字号、歌词颜色、主题色、深色模式、
+                 浮窗尺寸、键盘步进、自动检查更新。
+
+           保留：收藏、歌单、设备连接信息（HOST_MAC / LAST_IP /
+                 PLAYER_MAC）、主面板与浮窗位置、封面 URL 缓存、
+                 播放器相关参数（LMS_PORT / POLL_INTERVAL 等）。
+        """
+        # 局部导入避免模块级循环依赖
+        try:
+            from config import Config as _DefaultCfg
+        except Exception:
+            _DefaultCfg = None
+
+        if not self._ask_yesno(
+                "恢复默认设置",
+                "确定要将所有外观与行为设置恢复到默认值吗？\n\n"
+                "将重置：字体、字号、歌词颜色、主题色、深色模式、\n"
+                "浮窗尺寸、键盘步进、自动检查更新。\n\n"
+                "以下数据会保留：收藏、歌单、设备连接信息、\n"
+                "主面板与浮窗位置、封面缓存。",
+                danger=False):
+            return
+
+        # ★ 需要重置的键：只含「外观 / 行为偏好」
+        reset_keys = (
+            "FONT_FAMILY", "FONT_SIZE",
+            "COLOR_ACTIVE", "COLOR_IDLE", "COLOR_KEY", "COLOR_STROKE",
+            "ACCENT_COLOR",
+            "DARK_MODE",
+            "OVERLAY_W", "OVERLAY_H",
+            "OVERLAY_VISIBLE",
+            "SEEK_STEP", "VOL_STEP",
+            "AUTO_CHECK_UPDATE",
+        )
+
+        for key in reset_keys:
+            try:
+                # 从 Config 类属性取默认值（与 config.py 保持单一来源）
+                default_val = getattr(_DefaultCfg, key)
+                setattr(self.cfg, key, default_val)
+            except AttributeError:
+                # 类上没有该属性（Config 结构变化时兜底跳过）
+                pass
+            except Exception:
+                pass
+
+        try:
+            self.cfg.save()
+        except Exception:
+            pass
+
+        # ★ 关闭设置对话框（配置已变更，旧控件显示的是旧值）
+        #   用户再次打开时会看到新值
+        try:
+            self._close_settings_dialog()
+        except Exception:
+            pass
+
+        # ★ 刷新整个 UI（主题色、字体颜色、缓存、图标全部重算）
+        try:
+            self._apply_theme()
+        except Exception:
+            traceback.print_exc()
+
+        # ★ 刷新浮窗歌词（字体 / 颜色变化后立即生效）
+        try:
+            main, trans, next_t, _ = self._get_current_texts()
+            self.overlay.set_line(
+                main, next_t, self.track_info.get("title", ""), trans)
+        except Exception:
+            pass
+
+        # ★ 浮窗可见性跟随默认值
+        try:
+            if getattr(self.cfg, "OVERLAY_VISIBLE", True):
+                self.overlay.show()
+                self.btn_lyrics.set_text("♪")
+            else:
+                self.overlay.hide()
+                self.btn_lyrics.set_text("♩")
+        except Exception:
+            pass
+
+        # 视觉反馈
+        try:
+            self._lib_set_status("已恢复默认设置")
+        except Exception:
+            pass
+        
     def _set_vol_pct(self, v):
         """更新音量百分比标签（容错：标签可能尚未构建或被销毁）"""
         try:
@@ -2635,6 +3066,53 @@ class ControlPanel:
 
     def _seek_start(self):
         self._seeking = True
+    def _refresh_lyrics_now(self):
+        """立即刷新歌词（不等 100ms 轮询）。
+           与 _ui_tick 内歌词段逻辑一致，但只在 idx 变化时 set_line，
+           避免拖动时反复创建字体造成卡顿。"""
+        if not self.lines:
+            return
+        try:
+            idx = LrcParser.find_current(self.lines, self.song_pos)
+            main_idx = idx
+            if idx > 0:
+                t_prev = self.lines[idx - 1][0]
+                t_curr = self.lines[idx][0]
+                if (t_curr - t_prev < 0.6
+                        and self.lines[idx - 1][1] != self.lines[idx][1]):
+                    main_idx = idx - 1
+
+            if idx != self._last_idx:
+                self._last_idx = idx
+                self.cur_line_idx = main_idx
+                main, trans, next_t, _ = self._get_current_texts()
+                self.overlay.set_line(
+                    main, next_t,
+                    (self.track_info or {}).get("title", ""), trans)
+            else:
+                self.cur_line_idx = main_idx
+
+            if 0 <= main_idx < len(self.lines):
+                _m, _t, _n, t1 = self._get_current_texts()
+                t0 = self.lines[main_idx][0]
+                span = max(t1 - t0, 0.3)
+                self.overlay.set_progress((self.song_pos - t0) / span)
+        except Exception:
+            pass
+
+    def _on_progress_drag(self, val):
+        """进度条拖动中回调：立即同步 song_pos + 时间标签 + 歌词。"""
+        try:
+            pos = float(val)
+        except (TypeError, ValueError):
+            return
+        self.song_pos = pos
+        try:
+            self.lbl_time.config(
+                text=f"{self._fmt(pos)} / {self._fmt(self._duration)}")
+        except Exception:
+            pass
+        self._refresh_lyrics_now()
 
     def _seek_end(self, _e=None):
         if not self._seeking:
@@ -2647,6 +3125,12 @@ class ControlPanel:
                 self._last_seek_ts = time.time()
                 self._last_seek_target = pos      # ★ 记录目标
                 self._seek_retried = False        # ★ 重置重试标志
+
+                # ★ 松开后立即刷新歌词，不等下一帧 100ms 轮询
+                try:
+                    self._refresh_lyrics_now()
+                except Exception:
+                    pass
 
                 def work(p=pos):
                     try:
@@ -2745,23 +3229,50 @@ class ControlPanel:
             pass
 
     def _pick_color(self, key):
-        current = getattr(self.cfg, key)
-        _rgb, hexcolor = colorchooser.askcolor(color=current, parent=self.panel,
-                                               title="选择歌词颜色")
-        if hexcolor:
-            setattr(self.cfg, key, hexcolor)
-            self.cfg.save()
-            swatch_map = {
-                "COLOR_ACTIVE": self._swatch_active,
-                "COLOR_IDLE":   self._swatch_idle,
-                "COLOR_STROKE": self._swatch_stroke,
-            }
-            sw = swatch_map.get(key)
-            if sw:
-                sw()
-            
-            main, trans, next_t, _ = self._get_current_texts()
-            self.overlay.set_line(main, next_t, self.track_info.get("title", ""), trans)
+        current = getattr(self.cfg, key, "") or ""
+        if not current:
+            current = self.ACCENT if key == "ACCENT_COLOR" else "#000000"
+        _rgb, hexcolor = colorchooser.askcolor(
+            color=current, parent=self.panel, title="选择颜色")
+        if not hexcolor:
+            return
+        setattr(self.cfg, key, hexcolor)
+
+        # ★ 主题色：同步作为已唱色，并整体重算 UI
+        if key == "ACCENT_COLOR":
+            self.cfg.COLOR_ACTIVE = hexcolor
+            try:
+                self.cfg.save()
+            except Exception:
+                pass
+            if self._swatch_accent:
+                try:
+                    self._swatch_accent()
+                except Exception:
+                    pass
+            self._apply_theme()
+            try:
+                main, trans, next_t, _ = self._get_current_texts()
+                self.overlay.set_line(
+                    main, next_t, self.track_info.get("title", ""), trans)
+            except Exception:
+                pass
+            return
+
+        # 原有歌词颜色分支
+        self.cfg.save()
+        swatch_map = {
+            "COLOR_ACTIVE": self._swatch_active,
+            "COLOR_IDLE":   self._swatch_idle,
+            "COLOR_STROKE": self._swatch_stroke,
+        }
+        sw = swatch_map.get(key)
+        if sw:
+            sw()
+
+        main, trans, next_t, _ = self._get_current_texts()
+        self.overlay.set_line(main, next_t,
+                              self.track_info.get("title", ""), trans)
 
     # ================= 关于 / 更新 =================
     def _open_url(self, url):
@@ -2821,7 +3332,7 @@ class ControlPanel:
                     "command": lambda m=mac, n=name:
                         self._on_player_changed(m, n),
                 })
-        self._show_popup_menu(event, items, min_w=170)
+        self._show_popup_menu(event, items, min_w=130)
 
     def _on_player_changed(self, mac, name):
         if mac == self.lms.player_mac():
@@ -2884,8 +3395,9 @@ class ControlPanel:
             anchor="w", padx=18, pady=(4, 2))
 
         # ---------- ★ 先 pack 底部按钮行 ----------
-        btn_row = tk.Frame(dlg, bg=self.BG)
+        btn_row = tk.Frame(dlg, bg=self.BG, height=26)
         btn_row.pack(fill="x", side="bottom", padx=18, pady=(6, 10))
+        btn_row.pack_propagate(False)      # ★ 高度固定，按钮绝对居中
 
         result = {"ok": False}
 
@@ -3167,17 +3679,21 @@ class ControlPanel:
         while not self._stop:
             try:
                 st = self.lms.get_status()
-                # ★ 保护期由 1.5s 延长到 2.5s，给暂停态 LMS 充分同步时间
-                in_grace = (time.time() - self._last_seek_ts) <= 2.5
+                # ★ grace 期 1.5s
+                in_grace = (time.time() - self._last_seek_ts) <= 1.5
 
                 if not in_grace:
                     lms_time = float(st.get("time", 0) or 0)
                     mode = st.get("mode", "") or ""
-                    # ★ 暂停态同步校验：
-                    #   LMS 在 pause 下 time 命令偶有「未生效 / 返回旧值」，
-                    #   若本地 seek 目标与 LMS 时间差距 > 2 秒 → 视为未同步，
-                    #   重发一次 seek 并继续持有本地值。
-                    if (mode == "pause"
+
+                    # ---- stop：进度归零 ----
+                    if mode == "stop":
+                        self.song_pos = 0.0
+                        self._last_seek_target = None
+                        self._seek_retried = False
+
+                    # ---- pause 同步校验（保持原样）----
+                    elif (mode == "pause"
                             and self._last_seek_target is not None
                             and abs(lms_time - self._last_seek_target) > 2.0):
                         if not self._seek_retried:
@@ -3185,7 +3701,7 @@ class ControlPanel:
                                   f"{self._last_seek_target:.1f}s，"
                                   f"LMS {lms_time:.1f}s），重发 seek")
                             self._seek_retried = True
-                            self._last_seek_ts = time.time()   # 重新保护
+                            self._last_seek_ts = time.time()
                             try:
                                 target = self._last_seek_target
                                 threading.Thread(
@@ -3193,22 +3709,88 @@ class ControlPanel:
                                     daemon=True).start()
                             except Exception:
                                 traceback.print_exc()
-                            # 保持 self.song_pos（= 目标值），不覆写
                         else:
-                            # 重试过一次仍未同步 → 采用 LMS 值，放弃挣扎
                             print(f"[seek] 重试后仍未同步，采用 LMS 值 "
                                   f"{lms_time:.1f}s")
                             self.song_pos = lms_time
                             self._last_seek_target = None
                             self._seek_retried = False
+
+                    # ---- 正常播放 / pause 已同步 ----
                     else:
-                        self.song_pos = lms_time
-                        # 已同步 → 清空目标
-                        if (self._last_seek_target is not None
-                                and abs(lms_time
-                                        - self._last_seek_target) <= 2.0):
-                            self._last_seek_target = None
-                            self._seek_retried = False
+                        if self._last_seek_target is not None:
+                            diff = lms_time - self.song_pos
+                            if abs(diff) < 0.2:
+                                # 已足够接近 → 直接对齐清空
+                                self.song_pos = lms_time
+                                self._last_seek_target = None
+                                self._seek_retried = False
+                            elif diff > 0:
+                                # LMS 超前 → 平滑前进 0.3s/帧，视觉无跳变
+                                self.song_pos += min(0.3, diff)
+                            elif diff > -2.0:
+                                # ★ LMS 小幅落后 → 0.5x 前进，LMS 逐渐追上
+                                #   不回退（避免短句高亮倒退），不冻结（避免暂停感）
+                                try:
+                                    poll_interval = float(
+                                        getattr(self.cfg, "POLL_INTERVAL", 0.2))
+                                except (TypeError, ValueError):
+                                    poll_interval = 0.2
+                                self.song_pos += 0.5 * poll_interval
+                            else:
+                                # LMS 落后过大（> 2s）→ 异常（跨曲 / 播放停止），
+                                # 直接对齐
+                                self.song_pos = lms_time
+                                self._last_seek_target = None
+                                self._seek_retried = False
+                        else:
+                            self.song_pos = lms_time
+
+                # ★ grace 期内：song_pos 严格单调递增，绝不回退
+                #
+                #   背景：用户 seek 后（滑块或左右键），LMS 有 0.3~0.8s 响应延迟。
+                #   若本地推算超前 LMS，之前用"每帧回退 0.1s"对齐 →
+                #   短句（span<1s）里高亮会肉眼可见地"倒退"。
+                #
+                #   新逻辑：
+                #     · LMS 未响应（gap > 0.2）→ 0.5x 缓慢推算
+                #     · LMS 已响应但 time ≤ song_pos → 保持 song_pos 不变
+                #       （只冻结，等 LMS 以 1x 推进追上，绝不回退）
+                #     · LMS 超前 → 跟随 LMS
+                #     · LMS 异常落后（gap > 3s）→ seek 失败 / 跨曲，放弃推算
+                elif self._playing and self._last_seek_target is not None:
+                    lms_time_now = float(st.get("time", 0) or 0)
+                    gap = self._last_seek_target - lms_time_now
+                    if gap > 3.0:
+                        # seek 失败 / 跨曲：LMS 落点与目标差距过大，放弃推算
+                        self.song_pos = lms_time_now
+                        self._last_seek_target = None
+                        self._seek_retried = False
+                    else:
+                        # ★ 全程只前进，不冻结、不回退：
+                        #     derived  = target + 0.5 × elapsed
+                        #     song_pos = max(derived, lms_time)
+                        #
+                        #   · LMS 未响应（lms_time 还是旧值）→ derived 主导（0.5x 缓滚）
+                        #   · LMS 响应但落后 → lms_time < derived → derived 主导
+                        #     （高亮继续缓滚，LMS 慢慢追上来，无冻结）
+                        #   · LMS 追上 / 超前 → lms_time ≥ derived → LMS 主导（1x）
+                        #
+                        #   这样速度从 0.5x 平滑过渡到 1x，彻底消除「跟 0.2s →
+                        #   冻结 0.2s → 再跟」的暂停感。
+                        elapsed = time.time() - self._last_seek_ts
+                        derived = self._last_seek_target + elapsed * 0.5
+                        if self._duration and self._duration > 0:
+                            derived = min(self._duration, derived)
+                        if derived > self.song_pos:
+                            self.song_pos = derived
+                        if lms_time_now > self.song_pos:
+                            self.song_pos = lms_time_now
+
+                # ★ 关键：每轮都要从 LMS 刷新总时长
+                #   上一轮改写 grace 分支时漏掉了这一行 → _duration 恒为 0 →
+                #   进度条 to=1.0 被卡死、_seek_end 里 if self._duration 恒为 False
+                #   导致拖动进度条后根本不发 seek
                 self._duration = st.get("duration", 0.0)
 
                 # seek 保护期：如果本地是暂停态，忽略 LMS 瞬时的 "play" 通知，
@@ -4493,40 +5075,69 @@ class ControlPanel:
                     x = 16 * math.sin(t) ** 3
                     y = (13 * math.cos(t) - 5 * math.cos(2 * t)
                          - 2 * math.cos(3 * t) - math.cos(4 * t))
-                    px = W * 0.05 + (x + 16) / 32 * W * 0.90
-                    py = W * 0.05 + (11.924 - y) / 28.924 * W * 0.90
+                    # ★ 缩到 60% 画布（原 90%），与其他图标视觉大小一致
+                    pad = W * 0.20
+                    px = pad + (x + 16) / 32 * W * 0.60
+                    py = pad + (11.924 - y) / 28.924 * W * 0.60
                     points.append((px, py))
                 if kind == "heart":
                     d.polygon(points, fill=color)
                 else:
-                    lw = max(2, int(W * 0.09))
+                    lw = max(2, int(W * 0.07))
                     d.line(points + [points[0]], fill=color,
                            width=lw, joint="curve")
-
+            elif kind == "trash":
+                lw = max(2, int(W * 0.07))
+                # 顶盖横条（圆角，比桶身宽，体现"盖"）
+                d.rounded_rectangle(
+                    (W * 0.22, W * 0.28, W * 0.78, W * 0.36),
+                    radius=int(W * 0.03), fill=color)
+                # 顶部把手
+                d.line([(W * 0.40, W * 0.22), (W * 0.60, W * 0.22)],
+                       fill=color, width=lw)
+                # 把手两侧短竖
+                d.line([(W * 0.40, W * 0.20), (W * 0.40, W * 0.24)],
+                       fill=color, width=lw)
+                d.line([(W * 0.60, W * 0.20), (W * 0.60, W * 0.24)],
+                       fill=color, width=lw)
+                # 桶身（梯形，左右边略向内收）
+                d.line([(W * 0.30, W * 0.38), (W * 0.34, W * 0.82)],
+                       fill=color, width=lw)
+                d.line([(W * 0.70, W * 0.38), (W * 0.66, W * 0.82)],
+                       fill=color, width=lw)
+                d.line([(W * 0.34, W * 0.82), (W * 0.66, W * 0.82)],
+                       fill=color, width=lw)
+                # 内部两条竖线（跟随梯形垂直）
+                d.line([(W * 0.44, W * 0.44), (W * 0.44, W * 0.74)],
+                       fill=color, width=lw)
+                d.line([(W * 0.56, W * 0.44), (W * 0.56, W * 0.74)],
+                       fill=color, width=lw)
             elif kind == "play":
                 d.polygon([(W * 0.35, W * 0.22),
                            (W * 0.35, W * 0.78),
                            (W * 0.78, W * 0.50)], fill=color)
 
-            elif kind == "trash":
-                lw = max(2, int(W * 0.08))
-                d.rectangle((W * 0.28, W * 0.26, W * 0.72, W * 0.32),
-                            fill=color)
-                d.line([(W * 0.42, W * 0.20), (W * 0.42, W * 0.26)],
-                       fill=color, width=lw)
-                d.line([(W * 0.58, W * 0.20), (W * 0.58, W * 0.26)],
-                       fill=color, width=lw)
-                d.line([(W * 0.42, W * 0.20), (W * 0.58, W * 0.20)],
-                       fill=color, width=lw)
-                d.line([(W * 0.36, W * 0.34), (W * 0.40, W * 0.82)],
-                       fill=color, width=lw)
-                d.line([(W * 0.64, W * 0.34), (W * 0.60, W * 0.82)],
-                       fill=color, width=lw)
-                d.line([(W * 0.40, W * 0.82), (W * 0.60, W * 0.82)],
-                       fill=color, width=lw)
-                d.line([(W * 0.50, W * 0.42), (W * 0.50, W * 0.72)],
-                       fill=color, width=lw)
-
+            elif kind == "pause":
+                # 暂停图标：两根垂直圆角竖条，占据与 play 相同的视觉区域
+                bar_w = W * 0.15
+                gap = W * 0.12
+                total_w = bar_w * 2 + gap
+                bar_h = W * 0.56
+                sx = (W - total_w) / 2
+                sy = (W - bar_h) / 2
+                try:
+                    d.rounded_rectangle(
+                        (sx, sy, sx + bar_w, sy + bar_h),
+                        radius=int(bar_w / 2), fill=color)
+                    d.rounded_rectangle(
+                        (sx + bar_w + gap, sy, sx + total_w, sy + bar_h),
+                        radius=int(bar_w / 2), fill=color)
+                except Exception:
+                    d.rectangle((sx, sy, sx + bar_w, sy + bar_h),
+                                fill=color)
+                    d.rectangle((sx + bar_w + gap, sy,
+                                 sx + total_w, sy + bar_h), fill=color)
+                
             elif kind == "plus":
                 lw = max(2, int(W * 0.10))
                 d.line([(W * 0.22, W * 0.50), (W * 0.78, W * 0.50)],
@@ -4572,6 +5183,14 @@ class ControlPanel:
             return None
 
     def _dismiss_popup_menu(self):
+        # ★ 撤销全局左键监听（必须在 destroy 之前，否则 widget 已失效）
+        if getattr(self, "_popup_menu_click_handler", None) is not None:
+            try:
+                self.panel.unbind_all("<Button-1>")
+            except tk.TclError:
+                pass
+            self._popup_menu_click_handler = None
+
         win = getattr(self, "_popup_menu_win", None)
         if win is not None:
             try:
@@ -4603,12 +5222,12 @@ class ControlPanel:
             f = None
             fm = 18
 
-        row_h = 28
-        sep_h = 8
-        header_h = 22
-        pad_x = 10
-        icon_size = 16
-        icon_gap = 8
+        row_h = 24               # 更紧凑
+        sep_h = 6
+        header_h = 20
+        pad_x = 6                # 左右内边距再收
+        icon_size = 14           # 图标略缩
+        icon_gap = 4             # 图标与文字间更紧
 
         max_label_w = 0
         for it in items:
@@ -4624,7 +5243,7 @@ class ControlPanel:
             except Exception:
                 pass
 
-        W = max(min_w, pad_x * 2 + icon_size + icon_gap + max_label_w + 20)
+        W = max(min_w, pad_x * 2 + icon_size + icon_gap + max_label_w + 6)
         W = int(W)
 
         H = 6
@@ -4653,10 +5272,8 @@ class ControlPanel:
         # ---------- Toplevel ----------
         tip = tk.Toplevel(self.panel)
         tip.wm_overrideredirect(True)
-        try:
-            tip.attributes("-topmost", True)
-        except tk.TclError:
-            pass
+        # ★ 不设 -topmost：菜单不再压在其他程序之上
+        #   点击其他程序窗口时它们会覆盖菜单；点回主窗口则菜单依然可用。
 
         key_color = "#FF00FE"     # 罕见色，做透明 key
         transparent_ok = True
@@ -4781,6 +5398,7 @@ class ControlPanel:
 
         def in_menu(e):
             try:
+                tip.update_idletasks()          # ★ 保证坐标已定稿
                 wx = tip.winfo_rootx()
                 wy = tip.winfo_rooty()
                 ww = tip.winfo_width()
@@ -4816,9 +5434,16 @@ class ControlPanel:
                 except tk.TclError:
                     pass
 
+        def on_right_click(_e=None):
+            # 右键点击 → 关闭菜单（含菜单内 / 菜单外 / 再次右键）
+            self._dismiss_popup_menu()
+            return "break"
+
         canvas.bind("<Motion>", on_motion)
         canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Button-3>", on_right_click)
         canvas.bind("<Leave>", on_leave)
+        tip.bind("<Button-3>", on_right_click)          # 保险：整个 tip 也响应
         tip.bind("<Escape>", lambda _e: self._dismiss_popup_menu())
 
         self._popup_menu_win = tip
@@ -4827,6 +5452,66 @@ class ControlPanel:
             tip.focus_force()
         except tk.TclError:
             pass
+
+        # ★ 全局左键监听：点击菜单外立即关闭
+        #   grab_set 会把事件转发到 grab 窗口，但仅在应用内；
+        #   bind_all 能捕获应用内所有 widget 上的 <Button-1>，
+        #   比依赖 canvas / tip 上单一 bind 更稳。
+        def _global_b1(e):
+            if not in_menu(e):
+                self._dismiss_popup_menu()
+                return "break"
+            return None
+
+        self._popup_menu_click_handler = _global_b1
+        try:
+            self.panel.bind_all("<Button-1>", _global_b1, add="+")
+        except tk.TclError:
+            self._popup_menu_click_handler = None
+
+    # ---------- 右键菜单 ----------
+    def _make_play_pause_menu_item(self, track_id):
+        """构造右键菜单顶部「播放歌曲 / 暂停播放」项。
+           · 当前曲目 && 正在播放 → 暂停播放（点击 → toggle）
+           · 当前曲目 && 暂停中   → 播放歌曲（点击 → toggle，从当前位置继续）
+           · 其他曲目             → 播放歌曲（点击 → 加载专辑并从该曲播放）"""
+        tid = str(track_id or "")
+        cur_tid = str((self.track_info or {}).get("track_id") or "")
+        is_current = bool(cur_tid) and (tid == cur_tid)
+        is_playing_now = is_current and bool(self._playing)
+
+        if is_playing_now:
+            return {
+                "label": "暂停播放",
+                "icon": "pause",
+                "command": self._toggle_play,
+            }
+        if is_current:
+            return {
+                "label": "播放歌曲",
+                "icon": "play",
+                "command": self._toggle_play,
+            }
+        return {
+            "label": "播放歌曲",
+            "icon": "play",
+            "command": lambda t=tid: self._play_track_from_menu(t),
+        }
+
+    def _play_track_from_menu(self, tid):
+        """右键菜单「播放歌曲」：异步加载整张专辑并定位到指定曲目"""
+        tid = str(tid or "")
+        if not tid:
+            return
+
+        def work():
+            try:
+                self.lms.play_track(tid)
+            except Exception:
+                traceback.print_exc()
+
+        threading.Thread(target=work, daemon=True).start()
+
     # ---------- 右键菜单 ----------
     def _show_track_menu(self, event, track_id, title="", artist="", album=""):
         if not track_id:
@@ -4835,6 +5520,10 @@ class ControlPanel:
         is_fav = self._is_favorite(tid)
 
         items = []
+        # ★ 最上面：播放歌曲 / 暂停播放
+        items.append(self._make_play_pause_menu_item(tid))
+        items.append("sep")
+
         items.append({
             "label": "取消收藏" if is_fav else "添加收藏",
             "icon": "heart_off" if is_fav else "heart",
@@ -4864,13 +5553,13 @@ class ControlPanel:
 
         items.append("sep")
         items.append({
-            "label": "新建歌单…",
+            "label": "新建歌单",                    # 去掉结尾 "…"
             "icon": "plus",
             "command": lambda: self._add_to_new_playlist(
                 tid, title, artist, album),
         })
 
-        self._show_popup_menu(event, items, min_w=180)
+        self._show_popup_menu(event, items, min_w=110)   # 180 → 140
 
     def _on_lib_track_right_click(self, event):
         iid = self.tree_tracks.identify_row(event.y)
@@ -5263,7 +5952,7 @@ class ControlPanel:
             {"label": "删除歌单", "icon": "trash", "danger": True,
              "command": lambda: self._delete_playlist(iid)},
         ]
-        self._show_popup_menu(event, items, min_w=150)
+        self._show_popup_menu(event, items, min_w=100)
 
     def _on_pl_track_right_click(self, event):
         iid = self.pl_tracks_tree.identify_row(event.y)
@@ -5277,6 +5966,8 @@ class ControlPanel:
         is_fav = self._is_favorite(tid)
 
         items = [
+            self._make_play_pause_menu_item(tid),
+            "sep",
             {"label": "取消收藏" if is_fav else "添加收藏",
              "icon": "heart_off" if is_fav else "heart",
              "command": lambda: self._toggle_favorite(
@@ -5286,7 +5977,7 @@ class ControlPanel:
              "command": lambda: self._remove_track_from_current_playlist(
                  iid)},
         ]
-        self._show_popup_menu(event, items, min_w=160)  
+        self._show_popup_menu(event, items, min_w=110)  
 
     def _delete_playlist(self, pl_name):
         if not self._ask_yesno("删除歌单",
@@ -5408,8 +6099,9 @@ class ControlPanel:
                  justify="left", wraplength=W - 48,
                  anchor="w").pack(fill="x", padx=24, pady=(20, 14))
 
-        btn_row = tk.Frame(dlg, bg=self.BG)
+        btn_row = tk.Frame(dlg, bg=self.BG, height=26)
         btn_row.pack(fill="x", side="bottom", padx=20, pady=(0, 12))
+        btn_row.pack_propagate(False)     # ★ 高度固定 26，避免被内容撑大
 
         def on_ok():
             result["ok"] = True
@@ -5483,8 +6175,9 @@ class ControlPanel:
         ent.focus_set()
         ent.select_range(0, "end")
 
-        btn_row = tk.Frame(dlg, bg=self.BG)
+        btn_row = tk.Frame(dlg, bg=self.BG, height=26)
         btn_row.pack(fill="x", padx=32, pady=(0, 12))
+        btn_row.pack_propagate(False)
 
         def on_cancel(*_a):
             result["name"] = None
@@ -5786,7 +6479,83 @@ class ControlPanel:
             return photo
         except Exception:
             return None
-        
+    # ================= 美化控件工厂 =================
+
+    def _find_font_file_for_pil(self, family):
+        """查找字体文件路径（供 PIL 使用），按 family 小写缓存。"""
+        if not HAS_PIL:
+            return None
+        if not hasattr(self, "_pil_font_file_cache"):
+            self._pil_font_file_cache = {}
+        key = (family or "").lower().strip()
+        if key in self._pil_font_file_cache:
+            return self._pil_font_file_cache[key]
+
+        windir = os.environ.get("WINDIR") or "C:/Windows"
+        fonts_dir = os.path.join(windir, "Fonts")
+        candidates_map = {
+            "microsoft yahei ui": ["msyh.ttc", "msyh.ttf"],
+            "microsoft yahei":    ["msyh.ttc", "msyh.ttf"],
+            "微软雅黑":             ["msyh.ttc", "msyh.ttf"],
+            "simhei":             ["simhei.ttf"],
+            "黑体":                ["simhei.ttf"],
+            "simsun":             ["simsun.ttc"],
+            "宋体":                ["simsun.ttc"],
+            "consolas":           ["consola.ttf"],
+            "segoe ui":           ["segoeui.ttf"],
+            "segoe ui symbol":    ["seguisym.ttf"],
+            "arial":              ["arial.ttf"],
+        }
+        result = None
+        for fn in candidates_map.get(key, []):
+            p = os.path.join(fonts_dir, fn)
+            if os.path.isfile(p):
+                result = p
+                break
+        self._pil_font_file_cache[key] = result
+        return result
+
+    def _render_btn_text_photo(self, text, family, size_pt, color, w, h):
+        """PIL 渲染按钮文字为图片，字形 bbox 精确居中于 w×h 图中心。
+           相比 Tk create_text(anchor="center")：
+             · Tk 的 bbox 含字体 ascent/descent 空白 → 视觉偏上
+             · PIL textbbox() 返回字形实际像素边界 → 精确视觉居中
+        """
+        if not HAS_PIL or not text:
+            return None
+        try:
+            path = self._find_font_file_for_pil(family)
+            if not path:
+                return None
+            ss = 4  # 超采样倍数
+            W, H = int(w * ss), int(h * ss)
+            img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            px_size = max(8, int(round(size_pt * 96 / 72)) * ss)
+            try:
+                pf = ImageFont.truetype(path, px_size)
+            except Exception:
+                return None
+
+            # ★ 用 PIL 的字形实际像素边界（不含字体 ascent 空白）
+            try:
+                bbox = d.textbbox((0, 0), text, font=pf)
+            except AttributeError:
+                bbox = pf.getbbox(text)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            if tw <= 0 or th <= 0:
+                return None
+
+            # 把字形 bbox 中心对齐到 (W/2, H/2)
+            tx = (W - tw) / 2.0 - bbox[0]
+            ty = (H - th) / 2.0 - bbox[1]
+            d.text((tx, ty), text, font=pf, fill=color)
+
+            small = img.resize((int(w), int(h)), Image.LANCZOS)
+            return ImageTk.PhotoImage(small)
+        except Exception:
+            return None        
     # ================= 美化控件工厂 =================
     def _make_round_btn(self, parent, text, cmd, width=112, height=22,
                         radius=8, bg=None, btn_bg=None, font_size=9,
@@ -5844,14 +6613,49 @@ class ControlPanel:
             else:
                 canvas.create_rectangle(0, 0, w, h,
                                         fill=bg_color, outline=bg_color)
-
             # ★ PIL 图标优先：脱离字体 fallback，颜色完全可控
             if icon_kind is not None:
-                icon_size = max(10, min(w, h) - 4)
+                if state["text"]:
+                    # 图标 + 文字：图标尺寸按按钮高度收紧，与文字高度协调
+                    icon_size = max(10, height - 8)
+                else:
+                    icon_size = max(10, min(w, h) - 4)
                 photo = self._get_btn_icon(icon_kind, icon_size, fg_color)
                 if photo is not None:
-                    canvas.create_image(w // 2, h // 2, image=photo)
-                    canvas._btn_icon = photo      # 防 GC
+                    if state["text"]:
+                        txt_font = ("Microsoft YaHei UI", font_size)
+                        try:
+                            f = tkfont.Font(family=txt_font[0],
+                                            size=txt_font[1])
+                            tw = f.measure(state["text"])
+                        except Exception:
+                            tw = len(state["text"]) * 10
+                        icon_pad = 4
+                        total_w = icon_size + icon_pad + tw
+                        sx = (w - total_w) // 2
+                        # 图标（水平左对齐锚点，垂直固定为 h/2）
+                        canvas.create_image(sx, h // 2, image=photo,
+                                            anchor="w")
+                        canvas._btn_icon = photo      # 防 GC
+                        # ★ 文字用 PIL 渲染成独立图片，图中心 = 文字视觉中心
+                        #   水平锚点取"图标右侧 + icon_pad + tw/2"
+                        txt_cx = sx + icon_size + icon_pad + tw / 2.0
+                        text_photo = self._render_btn_text_photo(
+                            state["text"], "Microsoft YaHei UI",
+                            font_size, fg_color, tw + 8, h)
+                        if text_photo is not None:
+                            canvas.create_image(txt_cx, h // 2,
+                                                image=text_photo)
+                            canvas._btn_text_photo = text_photo
+                        else:
+                            # 兜底
+                            canvas.create_text(
+                                txt_cx, h // 2,
+                                text=state["text"], anchor="center",
+                                fill=fg_color, font=txt_font)
+                    else:
+                        canvas.create_image(w // 2, h // 2, image=photo)
+                        canvas._btn_icon = photo
                     return
 
             # ★ 图标字符用 Segoe UI Symbol（支持 ♩⚙⏻ 等），
@@ -5859,8 +6663,23 @@ class ControlPanel:
             # ★ icon_style 字符图标放大到至少 12pt，在 22px 按钮里更醒目
             txt_font = (("Segoe UI Symbol", max(font_size, 12)) if icon_style
                         else ("Microsoft YaHei UI", font_size))
+            # ★ 优先 PIL 渲染：字形 bbox 精确居中
+            #   Tk create_text(anchor="center") 按字体 bbox（含 ascent 空白）
+            #   对齐，中文字体 ascent 远大于 descent，视觉上会偏上；
+            #   之前的 metrics/bbox 补偿又容易过头变成偏下。
+            #   用 PIL 直接按字形实际像素边界居中，彻底避开这一问题。
+            if (not icon_style) and state["text"]:
+                text_photo = self._render_btn_text_photo(
+                    state["text"], "Microsoft YaHei UI",
+                    font_size, fg_color, w, h)
+                if text_photo is not None:
+                    canvas.create_image(w // 2, h // 2, image=text_photo)
+                    canvas._btn_text_photo = text_photo   # 防 GC
+                    return
+            # 兜底（无 PIL / icon_style / 字体文件缺失）：Tk 原生渲染
             canvas.create_text(w // 2, h // 2, text=state["text"],
-                               fill=fg_color, font=txt_font)
+                               fill=fg_color, font=txt_font,
+                               anchor="center", justify="center")
 
         def on_click(_e):
             if state["enabled"]:
@@ -6036,17 +6855,27 @@ class ControlPanel:
 
     def _make_color_swatch(self, parent, color_key, label_text):
         frame = tk.Frame(parent, bg=self.CARD)
-        lbl = tk.Label(frame, text=label_text, bg=self.CARD, fg=self.DIM, font=("Microsoft YaHei UI", 9))
+        lbl = tk.Label(frame, text=label_text, bg=self.CARD, fg=self.DIM,
+                       font=("Microsoft YaHei UI", 9))
         lbl.pack(side="left", padx=(0, 6))
 
-        canvas = tk.Canvas(frame, width=22, height=22, bg=self.CARD, highlightthickness=0, bd=0)
+        canvas = tk.Canvas(frame, width=22, height=22, bg=self.CARD,
+                           highlightthickness=0, bd=0)
         canvas.pack(side="left")
         state = {"hover": False}
 
+        def _current_color():
+            val = getattr(self.cfg, color_key, "")
+            if not val:
+                # ACCENT_COLOR 为空 → 显示当前解析出的主题色
+                return self.ACCENT
+            return val
+
         def redraw():
             canvas.delete("all")
-            color = getattr(self.cfg, color_key)
-            border = "#FFFFFF" if state["hover"] else ("#C0C0C8" if not self.cfg.DARK_MODE else "#5A5A78")
+            color = _current_color()
+            border = ("#FFFFFF" if state["hover"]
+                      else ("#C0C0C8" if not self.cfg.DARK_MODE else "#5A5A78"))
             x1, y1, x2, y2 = 1, 1, 21, 21
             r = 6
             points = [
@@ -6054,12 +6883,16 @@ class ControlPanel:
                 x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
                 x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
             ]
-            canvas.create_polygon(points, smooth=True, fill=color, outline=border, width=2)
+            canvas.create_polygon(points, smooth=True, fill=color,
+                                  outline=border, width=2)
 
-        def on_click(_e): self._pick_color(color_key)
+        def on_click(_e):
+            self._pick_color(color_key)
+
         def on_enter(_e):
             state["hover"] = True
             redraw()
+
         def on_leave(_e):
             state["hover"] = False
             redraw()
@@ -6069,8 +6902,8 @@ class ControlPanel:
             lbl.configure(bg=panel.CARD, fg=panel.DIM)
             canvas.configure(bg=panel.CARD)
             redraw()
-        canvas._update_theme = _update_theme
 
+        canvas._update_theme = _update_theme
         canvas.bind("<Button-1>", on_click)
         canvas.bind("<Enter>", on_enter)
         canvas.bind("<Leave>", on_leave)
@@ -7731,6 +8564,8 @@ class ControlPanel:
             return self._get_pin_icon(size, color, False)   # hover=False → 无背景
         if kind == "power":
             return self._get_power_icon(size, color)
+        if kind == "info":              # ★ 新增
+            return self._get_info_icon(size, color)        
         return None
 
     def _get_gear_icon(self, size, color):
@@ -7777,6 +8612,45 @@ class ControlPanel:
             small = img.resize((size, size), Image.LANCZOS)
             photo = ImageTk.PhotoImage(small)
             self._gear_icon_cache[key] = photo
+            return photo
+        except Exception:
+            return None
+
+    def _get_info_icon(self, size, color):
+        """信息图标：主题色实心圆 + 白色 i（点 + 竖条），醒目易辨认"""
+        if not hasattr(self, "_info_icon_cache"):
+            self._info_icon_cache = {}
+        # ★ color 参数仅用于兼容统一接口，实心圆固定用主题色
+        key = (size, self.ACCENT)
+        if key in self._info_icon_cache:
+            return self._info_icon_cache[key]
+        if not HAS_PIL:
+            return None
+        try:
+            ss = 4
+            W = size * ss
+            img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+
+            # 实心圆：主题色（醒目、跟随主题）
+            d.ellipse((0, 0, W - 1, W - 1), fill=self.ACCENT)
+
+            white = (255, 255, 255, 255)
+            # i 顶部圆点
+            dot_r = W * 0.085
+            dot_cy = W * 0.28
+            d.ellipse((W / 2 - dot_r, dot_cy - dot_r,
+                       W / 2 + dot_r, dot_cy + dot_r), fill=white)
+            # i 竖条（圆角，稍微加宽更醒目）
+            bar_w = W * 0.17
+            d.rounded_rectangle(
+                (W / 2 - bar_w / 2, W * 0.44,
+                 W / 2 + bar_w / 2, W * 0.80),
+                radius=int(bar_w / 2), fill=white)
+
+            small = img.resize((size, size), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(small)
+            self._info_icon_cache[key] = photo
             return photo
         except Exception:
             return None
