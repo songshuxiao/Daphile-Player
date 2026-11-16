@@ -73,6 +73,11 @@ class Config:
     # 手动连接 / 远程唤醒
     HOST_MAC = ""    # Daphile 主机网卡 MAC，用于 WOL
     LAST_IP  = ""    # 上次成功/手动输入的 IP，便于下次预填
+    # —— 本地音乐 ——
+    # 用户选择的音乐文件夹（可多个 Windows 路径），歌曲索引缓存在
+    # local-library.json 里；LOCAL_SPEAKER 表示当前是否用电脑扬声器播放
+    LOCAL_FOLDERS = []
+    LOCAL_SPEAKER = False
     # 更新检查
     AUTO_CHECK_UPDATE = True    # 启动时是否自动检查更新
     # —— 收藏 / 歌单 ——
@@ -100,6 +105,7 @@ class Config:
                      "OVERLAY_VISIBLE", "VOLUME_SLIDER_VISIBLE",   # ★ 新增
                      "DARK_MODE",
                      "HOST_MAC", "LAST_IP",
+                     "LOCAL_FOLDERS", "LOCAL_SPEAKER",
                      "AUTO_CHECK_UPDATE",
                      "SEEK_STEP", "VOL_STEP",
                      "FAVORITES", "PLAYLISTS")

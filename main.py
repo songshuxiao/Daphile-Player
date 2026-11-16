@@ -20,7 +20,10 @@ from discovery import NetDiscovery
 from lms_client import LmsClient
 from lyrics_fetcher import LyricsFetcher
 from karaoke_overlay import KaraokeOverlay
-from control_panel import ControlPanel, apply_dark_titlebar
+from control_panel import ControlPanel, apply_dark_titlebar, RoundButton
+
+# 连接对话框里「本地模式」的返回值标记
+LOCAL_MODE_FLAG = "__local__"
 
 def _resource_path(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -124,6 +127,161 @@ def _try_last_ip(cfg, timeout=0.8):
 
 
 # =========================================================
+# 本地模式（不连接达菲设备）
+# =========================================================
+class OfflineLms:
+    """本地模式用的空客户端：所有网络操作都返回空，播放全部走 Windows 扬声器。"""
+
+    host = ""
+    port = 0
+    server_name = "本地模式"
+    is_offline = True          # 供面板判断：本地模式（无达菲可关机）
+
+    def player_mac(self):
+        return ""
+
+    def set_player_mac(self, mac):
+        pass
+
+    def list_players(self):
+        return []
+
+    def get_status(self):
+        return {"mode": "stop", "time": 0.0, "duration": 0.0,
+                "track_id": None, "title": "", "artist": "", "album": "",
+                "coverid": "", "volume": 50, "queue": [], "cur_index": -1}
+
+    def command(self, cmd, player=None, retries=3):
+        return {}
+
+    def browse_artists(self):
+        return []
+
+    def browse_albums(self, artist_id):
+        return []
+
+    def browse_tracks(self, album_id):
+        return []
+
+    def browse_new_albums(self, limit=60):
+        return []
+
+    def search(self, query):
+        return {"artists": [], "albums": [], "tracks": []}
+
+    def play_track(self, track_id):
+        pass
+
+    def play_playlist(self, track_ids, start_index=0):
+        return False
+
+    def set_volume(self, val):
+        pass
+
+    def seek(self, sec):
+        pass
+
+    def next_track(self):
+        pass
+
+    def prev_track(self):
+        pass
+
+    def next_track_queue(self):
+        pass
+
+    def prev_track_queue(self):
+        pass
+
+    def get_server_mac(self):
+        return ""
+
+    def get_track_url(self, track_id):
+        return ""
+
+    def download_track(self, track_id, max_mb=None):
+        return None
+
+    def get_mai_lyrics(self, *a, **k):
+        return None, "离线模式"
+
+    def shutdown_daphile(self):
+        return False
+
+
+def _wire_close(cfg, overlay, panel):
+    """统一的主面板关闭处理（两种启动路径共用）。"""
+    def on_close():
+        try:
+            cfg.OVERLAY_X, cfg.OVERLAY_Y = overlay.get_position()
+        except Exception:
+            pass
+        try:
+            panel.save_position()
+        except Exception:
+            pass
+        # ★ 关掉本机音频设备，避免 Windows 扬声器模式的音频线程把进程挂住
+        try:
+            panel.local_player.close()
+        except Exception:
+            pass
+        try:
+            cfg.save()
+        except Exception:
+            pass
+        try:
+            overlay.root.destroy()
+        except Exception:
+            pass
+
+    atexit.register(cfg.save)
+    overlay.root.protocol("WM_DELETE_WINDOW", on_close)
+    panel.panel.protocol("WM_DELETE_WINDOW", on_close)
+
+
+def _switch_panel_to_local(cfg, panel):
+    """已有面板时切到本地模式（关机重连对话框里选「本地模式」）。"""
+    print("[启动] 切换到本地模式（不连接达菲）")
+    cfg.LOCAL_SPEAKER = True
+    try:
+        cfg.save()
+    except Exception:
+        pass
+    lms = OfflineLms()
+    try:
+        panel.reconnect(lms, LyricsFetcher(lms), "", "本地模式")
+        if not getattr(panel, "_win_mode", False):
+            panel._switch_to_windows_speaker()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+def _run_local_mode(cfg, overlay):
+    """启动时直接进入本地模式：不连达菲，也能播放本机音乐。"""
+    print("[启动] 本地模式：不连接达菲，只播放本机音乐")
+    cfg.LOCAL_SPEAKER = True
+    try:
+        cfg.save()
+    except Exception:
+        pass
+    lms = OfflineLms()
+    fetcher = LyricsFetcher(lms)
+    panel = ControlPanel(lms, overlay, fetcher, cfg)
+    _apply_icon(panel.panel)
+    panel.player_name = "本地模式"
+    try:
+        panel.lbl_server.config(text="本地模式")
+    except Exception:
+        pass
+    # ★ 本地模式下点右上角 ⏻（关闭达菲）→ 打开「连接 Daphile」窗口
+    panel.on_daphile_shutdown = lambda: _handle_daphile_shutdown(
+        cfg, overlay, panel)
+    _wire_close(cfg, overlay, panel)
+    overlay.run()
+
+
+# =========================================================
 # 连接对话框
 # =========================================================
 class ConnectDialog:
@@ -145,23 +303,17 @@ class ConnectDialog:
 
         self.win = tk.Toplevel(parent)
         self.win.title("连接 Daphile")
-        self.win.geometry("480x400")
         self.win.configure(bg=self.BG)
         self.win.attributes("-topmost", True)
         self.win.resizable(False, False)
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
         _apply_icon(self.win)
 
-        self.win.update_idletasks()
-        w, h = 480, 400
-        x = (self.win.winfo_screenwidth() - w) // 2
-        y = (self.win.winfo_screenheight() - h) // 2
-        self.win.geometry(f"{w}x{h}+{x}+{y}")
-
         # ★ 核心修复：跨线程使用 queue 通信
         self._queue = queue.Queue()
         self.win.after(100, self._poll_queue)
 
+        # ★ 先排版，再按内容算出紧凑尺寸并居中（不再写死 480x400）
         self._build_ui()
         try:
             apply_dark_titlebar(self.win, dark=True, bg_color=self.BG)
@@ -174,86 +326,128 @@ class ConnectDialog:
 
     def _build_ui(self):
         p = self.win
+        PAD = 16
+        p.columnconfigure(1, weight=1)
 
         tk.Label(p, text="连接 Daphile / LMS 服务器",
                  bg=self.BG, fg=self.FG,
-                 font=("Microsoft YaHei UI", 14, "bold")).pack(pady=(20, 4))
-        tk.Label(p, text="未找到服务器 —— 请手动输入 IP，或点击「重新扫描」",
+                 font=("Microsoft YaHei UI", 13, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w",
+            padx=PAD, pady=(12, 2))
+        tk.Label(p, text="未找到服务器 —— 输入 IP 后点「连接」，或点「重新扫描」",
                  bg=self.BG, fg=self.DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(pady=(0, 16))
+                 font=("Microsoft YaHei UI", 9)).grid(
+            row=1, column=0, columnspan=3, sticky="w",
+            padx=PAD, pady=(0, 8))
 
-        r1 = tk.Frame(p, bg=self.BG)
-        r1.pack(fill="x", padx=20, pady=4)
-        tk.Label(r1, text="服务器 IP", bg=self.BG, fg=self.FG,
-                 font=("Microsoft YaHei UI", 10), width=10,
-                 anchor="w").pack(side="left")
-        self.ent_ip = tk.Entry(r1, bg=self.FIELD, fg=self.FG,
+        # ---- 服务器 IP ----
+        tk.Label(p, text="服务器 IP", bg=self.BG, fg=self.FG,
+                 font=("Microsoft YaHei UI", 9), width=9,
+                 anchor="w").grid(row=2, column=0, sticky="w",
+                                  padx=(PAD, 6), pady=2)
+        self.ent_ip = tk.Entry(p, bg=self.FIELD, fg=self.FG,
                                insertbackground=self.FG, relief="flat",
                                font=("Consolas", 11))
-        self.ent_ip.pack(side="left", fill="x", expand=True, ipady=4, padx=4)
+        self.ent_ip.grid(row=2, column=1, sticky="ew", pady=2, ipady=2)
         self.ent_ip.insert(0, getattr(self.cfg, "LAST_IP", ""))
         self.ent_ip.bind("<Return>", lambda _e: self._try_connect())
-        self.btn_connect = self._mk_btn(r1, "连接", self._try_connect,
-                                        primary=True)
-        self.btn_connect.pack(side="left", padx=(4, 0))
 
-        r2 = tk.Frame(p, bg=self.BG)
-        r2.pack(fill="x", padx=20, pady=4)
-        tk.Label(r2, text="主机 MAC", bg=self.BG, fg=self.FG,
-                 font=("Microsoft YaHei UI", 10), width=10,
-                 anchor="w").pack(side="left")
-        self.ent_mac = tk.Entry(r2, bg=self.FIELD, fg=self.FG,
+        # ---- 主机 MAC（与 IP 输入框等宽）----
+        tk.Label(p, text="主机 MAC", bg=self.BG, fg=self.FG,
+                 font=("Microsoft YaHei UI", 9), width=9,
+                 anchor="w").grid(row=3, column=0, sticky="w",
+                                  padx=(PAD, 6), pady=2)
+        self.ent_mac = tk.Entry(p, bg=self.FIELD, fg=self.FG,
                                 insertbackground=self.FG, relief="flat",
                                 font=("Consolas", 11))
-        self.ent_mac.pack(side="left", fill="x", expand=True, ipady=4, padx=4)
+        self.ent_mac.grid(row=3, column=1, sticky="ew", pady=2, ipady=2)
         self.ent_mac.insert(0, getattr(self.cfg, "HOST_MAC", ""))
-        self.btn_wol = self._mk_btn(r2, "远程唤醒", self._wake,
-                                    primary=True)
-        self.btn_wol.pack(side="left", padx=(4, 0))
 
-        r3 = tk.Frame(p, bg=self.BG)
-        r3.pack(fill="x", padx=20, pady=(10, 8))
-        self.btn_rescan = self._mk_btn(r3, "重新扫描", self._rescan)
-        self.btn_rescan.pack(side="left")
-        # 取消按钮已移除，用户通过窗口右上角 × 关闭
+        # ---- 按钮：圆角矩形，高度与输入框一致 ----
+        p.update_idletasks()
+        bh = max(int(self.ent_ip.winfo_reqheight()), 24)
+        bw = 88
+        self.btn_connect = RoundButton(
+            p, "连接", self._try_connect,
+            width=bw, height=bh, radius=6, canvas_bg=self.BG,
+            bg=self.ACCENT, fg="#FFFFFF", hover_bg="#7A7AFF",
+            font=("Microsoft YaHei UI", 9, "bold"))
+        self.btn_connect.grid(row=2, column=2, sticky="ew",
+                              padx=(8, PAD), pady=2)
 
-        tk.Label(p, text="提示：唤醒后请等待 30~60 秒，再点「连接」或「重新扫描」",
+        self.btn_wol = RoundButton(
+            p, "唤醒", self._wake,
+            width=bw, height=bh, radius=6, canvas_bg=self.BG)
+        self.btn_wol.grid(row=3, column=2, sticky="ew",
+                          padx=(8, PAD), pady=2)
+
+        # 唤醒下方：本地模式（同样式）
+        self.btn_local = RoundButton(
+            p, "本地模式", self._enter_local_mode,
+            width=bw, height=bh, radius=6, canvas_bg=self.BG)
+        self.btn_local.grid(row=4, column=2, sticky="ew",
+                            padx=(8, PAD), pady=2)
+
+        # 重新扫描：也在输入框高度上
+        self.btn_rescan = RoundButton(
+            p, "重新扫描", self._rescan,
+            width=bw, height=bh, radius=6, canvas_bg=self.BG)
+        self.btn_rescan.grid(row=4, column=0, columnspan=2, sticky="w",
+                             padx=(PAD, 0), pady=2)
+
+        tk.Label(p, text="提示：唤醒后请等 30~60 秒再点「连接」",
                  bg=self.BG, fg=self.DIM,
                  font=("Microsoft YaHei UI", 9),
-                 wraplength=440, justify="left").pack(fill="x", padx=20,
-                                                      pady=(0, 4))
+                 justify="left").grid(
+            row=5, column=0, columnspan=3, sticky="w",
+            padx=PAD, pady=(8, 2))
 
         self.lbl_status = tk.Label(p, text="",
-                                    bg=self.BG, fg=self.DIM,
-                                    font=("Microsoft YaHei UI", 9),
-                                    wraplength=440, justify="left")
-        self.lbl_status.pack(fill="x", padx=20)
+                                   bg=self.BG, fg=self.DIM,
+                                   font=("Microsoft YaHei UI", 9),
+                                   wraplength=460, justify="left",
+                                   anchor="w")
+        self.lbl_status.grid(row=6, column=0, columnspan=3, sticky="ew",
+                             padx=PAD, pady=(0, 12))
 
-    def _mk_btn(self, parent, text, cmd, primary=False):
-        if primary:
-            bg = self.ACCENT
-            fg = "#FFFFFF"
-            active_bg = "#7A7AFF"
-            active_fg = "#FFFFFF"
-            font_style = ("Microsoft YaHei UI", 10, "bold")
-            padx, pady = 14, 4
-            disabled_fg = "#C8C8E0"
-        else:
-            bg = self.CARD
-            fg = self.FG
-            active_bg = self.ACCENT
-            active_fg = "#FFFFFF"
-            font_style = ("Microsoft YaHei UI", 10)
-            padx, pady = 10, 3
-            disabled_fg = "#808090"
+        # ★ 按内容定尺寸（比原来的 480x400 紧凑）
+        p.update_idletasks()
+        w = min(max(int(p.winfo_reqwidth()), 440), 560)
+        h = int(p.winfo_reqheight())
+        x = (p.winfo_screenwidth() - w) // 2
+        y = (p.winfo_screenheight() - h) // 3
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+        # 映射后再精确对齐一次按钮高度（与输入框像素级一致）
+        self.win.after(30, self._sync_button_heights)
 
-        return tk.Button(parent, text=text, command=cmd,
-                         bg=bg, fg=fg,
-                         activebackground=active_bg,
-                         activeforeground=active_fg,
-                         disabledforeground=disabled_fg,
-                         relief="flat", font=font_style,
-                         padx=padx, pady=pady, cursor="hand2")
+    def _sync_button_heights(self):
+        try:
+            h = int(self.ent_ip.winfo_height())
+        except (tk.TclError, AttributeError):
+            return
+        if h < 8:
+            return
+        for b in (self.btn_connect, self.btn_wol, self.btn_local,
+                  self.btn_rescan):
+            try:
+                b.set_height(h)
+            except Exception:
+                pass
+
+    def _set_status(self, text, color=None):
+        try:
+            self.lbl_status.config(text=text, fg=color or self.DIM)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _enter_local_mode(self):
+        """不连接达菲，直接进入本地模式（播放本机音乐）。"""
+        self._canceled = False
+        self.result = (LOCAL_MODE_FLAG, 0)
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
 
     def _set_status(self, text, color=None):
         try:
@@ -264,7 +458,8 @@ class ConnectDialog:
     def _set_busy(self, busy):
         self._busy = busy
         st = "disabled" if busy else "normal"
-        for b in (self.btn_connect, self.btn_wol, self.btn_rescan):
+        for b in (self.btn_connect, self.btn_wol, self.btn_rescan,
+                  self.btn_local):
             try:
                 b.config(state=st)
             except (tk.TclError, RuntimeError):
@@ -421,7 +616,7 @@ class ConnectDialog:
                         pass
                 else:
                     self._set_status(
-                        "未找到服务器，请手动输入 IP 或点击「远程唤醒」",
+                        "未找到服务器，请手动输入 IP 或点击「唤醒」",
                         self.ERR)
 
             self._queue.put(apply)
@@ -460,6 +655,20 @@ def _handle_daphile_shutdown(cfg, overlay, panel):
     result = dlg.wait()
 
     if not result:
+        if getattr(panel.lms, "is_offline", False):
+            # ★ 本地模式下取消连接：回到本地模式继续用，不退出程序
+            print("[连接] 已取消，继续本地模式")
+            try:
+                panel.panel.deiconify()
+                panel.panel.lift()
+            except tk.TclError:
+                pass
+            try:
+                if getattr(cfg, "OVERLAY_VISIBLE", True):
+                    overlay.show()
+            except Exception:
+                pass
+            return
         print("[关机] 用户取消重连，退出程序")
         try:
             panel.save_position()
@@ -477,6 +686,11 @@ def _handle_daphile_shutdown(cfg, overlay, panel):
 
     host, port = result
     print(f"[关机] 选择重连: {host}:{port}")
+
+    # ★ 用户选择「本地模式」：不连达菲，直接本机播放
+    if host == LOCAL_MODE_FLAG:
+        _switch_panel_to_local(cfg, panel)
+        return
 
     try:
         new_lms = LmsClient(host, port, cfg.PLAYER_MAC)
@@ -498,10 +712,18 @@ def _handle_daphile_shutdown(cfg, overlay, panel):
     _remember_host_mac(cfg, host, players, lms_client=new_lms)
 
     new_fetcher = LyricsFetcher(new_lms)
+    was_local = getattr(panel.lms, "is_offline", False)
     panel.reconnect(
         new_lms, new_fetcher,
         players[0][1] if players else "",
         f"{host}:{port}")
+    # ★ 从本地模式连上达菲后，把输出切回达菲扬声器
+    if was_local:
+        try:
+            panel._on_player_changed(
+                new_lms.player_mac(), players[0][1] if players else "")
+        except Exception:
+            pass
 
     print("[关机] 重连成功，主界面已恢复")
 
@@ -533,6 +755,10 @@ def main():
             overlay.root.destroy()
             return
         host, port = discovered
+        # ★ 用户选「本地模式」：不连达菲，直接跑本地播放
+        if host == LOCAL_MODE_FLAG:
+            _run_local_mode(cfg, overlay)
+            return
         try:
             test = LmsClient(host, port, cfg.PLAYER_MAC)
             players = test.list_players()
@@ -563,24 +789,7 @@ def main():
     panel.on_daphile_shutdown = lambda: _handle_daphile_shutdown(
         cfg, overlay, panel)
 
-    def on_close():
-        try:
-            cfg.OVERLAY_X, cfg.OVERLAY_Y = overlay.get_position()
-        except Exception:
-            pass
-        try:
-            panel.save_position()
-        except Exception:
-            pass
-        cfg.save()
-        try:
-            overlay.root.destroy()
-        except Exception:
-            pass
-
-    atexit.register(cfg.save)
-    overlay.root.protocol("WM_DELETE_WINDOW", on_close)
-    panel.panel.protocol("WM_DELETE_WINDOW", on_close)
+    _wire_close(cfg, overlay, panel)
 
     # ★ 启动时不主动显示浮窗（避免出现一块空白歌词条）
     #   有播放内容时由 _ui_tick 自动显示，或用户点击 ♩ 手动切换

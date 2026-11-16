@@ -101,7 +101,7 @@ class LmsClient:
     # ---------- 状态（★ 一次拉全队列，含 album_id/artist_id） ----------
     def get_status(self):
         # 从队列头开始取，确保拿到完整队列
-        res = self.command(["status", 0, 500, "tags:dglsyeatK"])
+        res = self.command(["status", 0, 500, "tags:dglsyeatKu"])
         loop = res.get("playlist_loop", []) or []
 
         try:
@@ -122,6 +122,7 @@ class LmsClient:
                 "pos": i,
                 "id": str(t.get("id", "")),
                 "title": t.get("title", ""),
+                "url": t.get("url", ""),
                 "album_id": t.get("album_id"),
                 "artist_id": t.get("artist_id"),
                 "tracknum": t.get("tracknum", 0),
@@ -142,6 +143,7 @@ class LmsClient:
             "duration": float(cur_raw.get("duration", 0) or 0),
             "track_id": cur_raw.get("id"),
             "title": cur_raw.get("title", ""),
+            "url": cur_raw.get("url", ""),
             "artist": cur_raw.get("artist", ""),
             "album": cur_raw.get("album", ""),
             "coverid": str(cur_raw.get("coverid", "") or ""),

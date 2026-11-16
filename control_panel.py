@@ -12,15 +12,26 @@ import urllib.request
 import webbrowser
 import math  
 import re
+import shutil
+import subprocess
 import tkinter as tk
 try:
     import ctypes
 except ImportError:
     ctypes = None
 from tkinter import ttk, colorchooser, messagebox, font as tkfont, simpledialog
+from tkinter import filedialog
 from io import BytesIO
 
 from lrc_parser import LrcParser
+from local_library import LocalLibrary, is_local_id
+from local_player import LocalPlayer, HAS_AUDIO
+
+try:
+    from av_decoder import HAS_AV as HAS_AV_DECODER, decode_to_pcm
+except Exception:                                  # pragma: no cover
+    HAS_AV_DECODER = False
+    decode_to_pcm = None
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -29,7 +40,7 @@ except ImportError:
     HAS_PIL = False
 
 
-APP_VERSION = "v10.0.0"
+APP_VERSION = "v11.0.0"
 APP_REPO = "songshuxiao/Daphile-Player"
 GITHUB_URL = f"https://github.com/{APP_REPO}"
 RELEASES_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
@@ -427,6 +438,164 @@ class _TimeLabel(tk.Label):
 
     configure = config
 
+
+class RoundButton(tk.Canvas):
+    """圆角矩形按钮（Canvas 自绘），供独立窗口（如连接窗口）复用。
+
+    接口尽量贴近 tk.Button：text / command / state，可 pack/grid。"""
+
+    def __init__(self, parent, text="", command=None,
+                 width=92, height=28, radius=8,
+                 bg="#20202E", fg="#E8E8F0",
+                 hover_bg="#5A5AE0", hover_fg="#FFFFFF",
+                 disabled_fg="#808090",
+                 canvas_bg=None, font=("Microsoft YaHei UI", 9),
+                 padx=6):
+        if canvas_bg is None:
+            try:
+                canvas_bg = parent.cget("bg")
+            except Exception:
+                canvas_bg = "#15151E"
+        super().__init__(parent, width=width, height=height,
+                         bg=canvas_bg, highlightthickness=0, bd=0,
+                         cursor="hand2")
+        self._rw = int(width)      # 注意：不能用 _w，那是 tkinter 内部的控件路径
+        self._rh = int(height)
+        self._radius = int(radius)
+        self._bg = bg
+        self._fg = fg
+        self._hover_bg = hover_bg
+        self._hover_fg = hover_fg
+        self._disabled_fg = disabled_fg
+        self._text = text
+        self._font = font
+        self._padx = padx
+        self._command = command
+        self._state = "normal"
+        self._hover = False
+
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self._draw()
+
+    # ---------- 绘制 ----------
+    def _draw(self):
+        try:
+            self.delete("all")
+        except tk.TclError:
+            return
+        w, h, r = self._rw, self._rh, self._radius
+        disabled = (self._state == "disabled")
+        if disabled:
+            fill = self._bg
+            fg = self._disabled_fg
+        elif self._hover:
+            fill = self._hover_bg
+            fg = self._hover_fg
+        else:
+            fill = self._bg
+            fg = self._fg
+        if r > 0:
+            pts = [r, 0, w - r, 0, w, 0, w, r,
+                   w, h - r, w, h, w - r, h, r, h,
+                   0, h, 0, h - r, 0, r, 0, 0]
+            self.create_polygon(pts, smooth=True, splinesteps=24,
+                                fill=fill, outline="")
+        else:
+            self.create_rectangle(0, 0, w, h, fill=fill, outline="")
+        self.create_text(w / 2.0, h / 2.0, text=self._text, fill=fg,
+                         font=self._font)
+
+    # ---------- 交互 ----------
+    def _on_click(self, _e=None):
+        if self._state == "disabled":
+            return "break"
+        if callable(self._command):
+            try:
+                self._command()
+            except Exception:
+                traceback.print_exc()
+        return "break"
+
+    def _on_enter(self, _e=None):
+        self._hover = True
+        self._draw()
+
+    def _on_leave(self, _e=None):
+        self._hover = False
+        self._draw()
+
+    # ---------- tk.Button 兼容 ----------
+    def set_text(self, text):
+        if text != self._text:
+            self._text = text
+            self._draw()
+
+    def set_height(self, height):
+        """按钮实际高度与同行输入框对齐时用（布局完成后同步）。"""
+        try:
+            height = int(height)
+        except (TypeError, ValueError):
+            return
+        if height < 8 or height == self._rh:
+            return
+        self._rh = height
+        try:
+            super().configure(height=height)
+        except tk.TclError:
+            pass
+        self._draw()
+
+    def set_state(self, state):
+        self._state = "disabled" if state in ("disabled", "disable") else "normal"
+        self.configure(cursor="" if self._state == "disabled" else "hand2")
+        self._draw()
+
+    def config(self, cnf=None, **kw):
+        handled = False
+        if "text" in kw:
+            self._text = kw.pop("text")
+            handled = True
+        if "state" in kw:
+            self._state = ("disabled"
+                           if kw.pop("state") in ("disabled", "disable")
+                           else "normal")
+            handled = True
+        if "command" in kw:
+            self._command = kw.pop("command")
+            handled = True
+        for key, attr in (("bg", "_bg"), ("fg", "_fg"),
+                          ("hover_bg", "_hover_bg"),
+                          ("hover_fg", "_hover_fg"),
+                          ("disabled_fg", "_disabled_fg"),
+                          ("canvas_bg", None)):
+            if key in kw:
+                val = kw.pop(key)
+                if attr:
+                    setattr(self, attr, val)
+                else:
+                    super().configure(bg=val)
+                handled = True
+        if handled:
+            self._draw()
+        if kw or cnf is not None:
+            return super().config(cnf, **kw)
+        return None
+
+    configure = config
+
+
+class _MenuAnchor:
+    """弹出菜单的定位锚点：_show_popup_menu 只用到 x_root / y_root。"""
+
+    __slots__ = ("x_root", "y_root")
+
+    def __init__(self, x_root, y_root):
+        self.x_root = x_root
+        self.y_root = y_root
+
+
 class ControlPanel:
 
     def __init__(self, lms, overlay, fetcher, cfg):
@@ -434,6 +603,27 @@ class ControlPanel:
         self.overlay = overlay
         self.fetcher = fetcher
         self.cfg = cfg
+
+        # ================= 本地音乐 / Windows 扬声器 =================
+        try:
+            from config import USER_CONFIG_FILE as _UCFG
+            self._app_dir = os.path.dirname(os.path.abspath(_UCFG))
+        except Exception:
+            self._app_dir = os.path.dirname(os.path.abspath(__file__))
+        self.local_lib = LocalLibrary(
+            os.path.join(self._app_dir, "local-library.json"))
+        self.local_lib.load()
+        self.local_lib.set_folders(getattr(self.cfg, "LOCAL_FOLDERS", []) or [])
+        self.local_player = LocalPlayer()
+        self._win_mode = bool(getattr(self.cfg, "LOCAL_SPEAKER", False))
+        self._win_queue = []          # [{"kind": "local"/"lms", ...}]
+        self._win_idx = -1
+        self._win_cache_dir = os.path.join(self._app_dir, "cache", "tracks")
+        self._win_scan_busy = False
+        self._lib_current_artist = ""
+        self._local_cover_key = ""
+        self._media_server = None     # 本地文件推流给达菲用的 HTTP 服务
+        self._pushed = None           # 当前推给达菲的本地曲目（用于修正显示）
 
         if getattr(self.cfg, "DARK_MODE", True):
             self.BG = "#15151E"; self.CARD = "#20202E"; self.FIELD = "#1A1A24"
@@ -587,6 +777,20 @@ class ControlPanel:
         self._build_style()
         self._build_ui()
         self._sync_font_controls()
+        if self._win_mode:
+            try:
+                self.lbl_player.config(text=" Windows 扬声器 ▼", fg=self.ACCENT)
+            except Exception:
+                pass
+        try:
+            self.local_player.set_volume(int(float(self.scl_vol.get())))
+        except Exception:
+            pass
+        # ★ 本地模式：隐藏左上角三个达菲相关按钮
+        try:
+            self._apply_header_visibility()
+        except Exception:
+            pass
 
         self.panel.update_idletasks()
         try:
@@ -609,7 +813,18 @@ class ControlPanel:
         self._stop = False
         threading.Thread(target=self._poll_loop, daemon=True).start()
         self._ui_tick_loop()
-
+        # ★ 500ms 周期性刷新收藏按钮状态（切歌后爱心自动跟随）
+        try:
+            self.panel.after(500, self._refresh_current_buttons_periodic)
+        except tk.TclError:
+            pass
+        # ★ 已设置本地音乐文件夹但还没有索引缓存 → 后台补扫一次
+        try:
+            if (getattr(self.cfg, "LOCAL_FOLDERS", None)
+                    and self.local_lib.count() == 0):
+                self.panel.after(1500, lambda: self._start_local_scan())
+        except Exception:
+            pass
         if getattr(self.cfg, "AUTO_CHECK_UPDATE", True):
             self.panel.after(3000, lambda: self._check_update(auto=True))
         # 标题栏深色（窗口真正映射后再设置更可靠）
@@ -715,10 +930,22 @@ class ControlPanel:
         self._vol_auto_shown = False
         if self._volume_slider_visible:
             self._set_volume_bar_visible(False, persist=False)
-            
+
+    def _flash_volume_bar(self):
+        """音量条隐藏时临时展开，并启动 2 秒自动收起计时。
+           供滚轮与键盘上下键共用。
+           · 手动展开（_vol_auto_shown=False）不受影响，不会启动计时
+           · 简洁模式主面板不可见，直接跳过"""
+        if self._compact_mode:
+            return
+        if not self._volume_slider_visible:
+            self._vol_auto_shown = True
+            self._set_volume_bar_visible(True, persist=False)
+        if self._vol_auto_shown:
+            self._schedule_vol_auto_hide()
+
     def _on_mousewheel_volume(self, event):
-        """滚轮控制音量；若音量条当前隐藏，自动临时展开，2 秒后自动收起。
-           仅「播放中」标签页与简洁模式生效；输入类控件保留自身滚轮行为。"""
+        """滚轮控制音量；音量条隐藏时自动临时展开，2 秒后自动收起。"""
         try:
             delta = event.delta
         except AttributeError:
@@ -726,9 +953,7 @@ class ControlPanel:
         if not delta:
             return None
 
-        if self._compact_mode:
-            pass
-        else:
+        if not self._compact_mode:
             try:
                 if self.nb.index(self.nb.select()) != 0:
                     return None
@@ -748,18 +973,11 @@ class ControlPanel:
             cur_vol = 50
         new_vol = max(0, min(100, cur_vol + steps * step))
 
-        # ★ 音量条隐藏时 → 滚轮触发临时展开（不写入 cfg）
-        if not self._volume_slider_visible:
-            self._vol_auto_shown = True
-            self._set_volume_bar_visible(True, persist=False)
-        # ★ 仅对「滚轮临时展开」状态启动 2 秒自动收起；
-        #   用户手动开启的音量条不受影响，永远保持显示。
-        if self._vol_auto_shown:
-            self._schedule_vol_auto_hide()
+        # ★ 统一入口：隐藏时临时展开 + 刷新 2 秒自动收起计时
+        self._flash_volume_bar()
 
         if new_vol == cur_vol:
             return "break"
-
         self.scl_vol.set(new_vol)
         self._on_volume(str(new_vol))
         return "break"
@@ -820,12 +1038,14 @@ class ControlPanel:
                 self._toggle_play()
                 return "break"
             elif event.keysym == "Up":
+                self._flash_volume_bar()          # ★ 新增：与滚轮同样效果
                 step = max(1, int(getattr(self.cfg, "VOL_STEP", 5)))
                 vol = min(100, int(self.scl_vol.get() + step))
                 self.scl_vol.set(vol)
                 self._on_volume(str(vol))
                 return "break"
             elif event.keysym == "Down":
+                self._flash_volume_bar()          # ★ 新增：与滚轮同样效果
                 step = max(1, int(getattr(self.cfg, "VOL_STEP", 5)))
                 vol = max(0, int(self.scl_vol.get() - step))
                 self.scl_vol.set(vol)
@@ -846,7 +1066,10 @@ class ControlPanel:
 
                 def work_l(p=pos):
                     try:
-                        self.lms.seek(p)
+                        if self._win_mode:
+                            self.local_player.seek(p)
+                        else:
+                            self.lms.seek(p)
                     except Exception:
                         traceback.print_exc()
                 threading.Thread(target=work_l, daemon=True).start()
@@ -866,7 +1089,10 @@ class ControlPanel:
 
                 def work_r(p=pos):
                     try:
-                        self.lms.seek(p)
+                        if self._win_mode:
+                            self.local_player.seek(p)
+                        else:
+                            self.lms.seek(p)
                     except Exception:
                         traceback.print_exc()
                 threading.Thread(target=work_r, daemon=True).start()
@@ -1337,7 +1563,17 @@ class ControlPanel:
         head = tk.Frame(p, bg=self.BG)
         head.pack(fill="x", padx=10, pady=(10, 10))
         self.head = head                       # ★ 新增
-
+        
+        # ★ 播放顺序状态：sequential（顺序播放）/ repeat_one（单曲循环）
+        #   两者都只在应用内生效，绝不下发 LMS 的 repeat / shuffle 命令
+        self._play_order = "sequential"
+        self._repeat_one = False        # 单曲循环开关（应用内）
+        self._ro_prev = None            # 上一轮 poll 快照，用于判断「曲目自然播完」
+        self._ro_guard_until = 0.0      # 重播后的防抖截止时间
+        self._ro_hold_until = 0.0       # 重播过渡期：屏蔽下一曲的 UI 刷新
+        self._ro_hold_tid = ""          # 过渡期内真正要显示的曲目 id
+        # ★ 用于周期性刷新收藏按钮状态的 track_id 缓存
+        self._last_fav_check_track_id = None
         # ★ 音量条显隐状态（默认隐藏；沿用上次保存的选择）
         self._volume_slider_visible = bool(
             getattr(self.cfg, "VOLUME_SLIDER_VISIBLE", False))
@@ -1424,7 +1660,11 @@ class ControlPanel:
         self._bind_tooltip(self.btn_compact, "简洁模式")            
         # ★ 新增：达菲设置 / 关闭达菲
         self._bind_tooltip(self.btn_daphile_settings, "达菲设置")
-        self._bind_tooltip(self.btn_shutdown, "关闭达菲")
+        # 本地模式下这个按钮是「打开连接窗口」，提示文字跟着变
+        self._bind_tooltip(
+            self.btn_shutdown,
+            lambda: "连接 Daphile"
+            if getattr(self.lms, "is_offline", False) else "关闭达菲")
         # ★ 新增：LYRION / 播放器图标按钮提示
         self._bind_tooltip(self.btn_server_web, "LYRION")
         self._bind_tooltip(self.btn_player_icon,
@@ -1503,23 +1743,57 @@ class ControlPanel:
         self.progress.pack(fill="x", pady=(4, 0))     # 时间行与进度条几乎贴合
 
         ctl = tk.Frame(f1, bg=self.BG)
-        ctl.pack(pady=(10, 6))  
-        self._ctl = ctl                        # ★ 新增
+        ctl.pack(fill="x", pady=(10, 6))
+        self._ctl = ctl
+
+        # ★ 三列布局：左（播放顺序）| 中（上一曲/播放/下一曲）| 右（收藏 + 加歌单）
+        ctl.columnconfigure(0, weight=1)
+        ctl.columnconfigure(1, weight=0)
+        ctl.columnconfigure(2, weight=1)
+
+        # ---- 左：播放顺序按钮（圆形 + 居中图标，与上下曲同款）----
+        self.btn_play_order = self._make_icon_circle_btn(
+            ctl, "repeat", self._cycle_play_mode, diameter=38)
+        self.btn_play_order.grid(row=0, column=0, sticky="w", padx=(10, 0))
+        self._bind_tooltip(
+            self.btn_play_order, lambda: self._play_order_tooltip())
+
+        # ---- 中：上一曲 / 播放 / 下一曲 ----
+        center = tk.Frame(ctl, bg=self.BG)
+        center.grid(row=0, column=1)
 
         self.btn_prev = self._make_play_btn(
-            ctl, "◀◀", lambda: self._cmd("prev"),
+            center, "◀◀", lambda: self._cmd("prev"),
             diameter=38, font_size=10, primary=False)
         self.btn_prev.pack(side="left", padx=8)
 
         self.btn_play = self._make_play_btn(
-            ctl, "▶", self._toggle_play,
+            center, "▶", self._toggle_play,
             diameter=50, font_size=16, primary=True)
         self.btn_play.pack(side="left", padx=8)
 
         self.btn_next = self._make_play_btn(
-            ctl, "▶▶", lambda: self._cmd("next"),
+            center, "▶▶", lambda: self._cmd("next"),
             diameter=38, font_size=10, primary=False)
         self.btn_next.pack(side="left", padx=8)
+
+        # ---- 右：收藏 + 加歌单（与上下曲同款的圆形图标按钮） ----
+        right = tk.Frame(ctl, bg=self.BG)
+        right.grid(row=0, column=2, sticky="e", padx=(0, 10))
+
+        self.btn_fav_current = self._make_icon_circle_btn(
+            right, "heart_off", lambda: self._toggle_current_fav(),
+            diameter=38)
+        self.btn_fav_current.pack(side="left", padx=(0, 8))
+        self._bind_tooltip(
+            self.btn_fav_current,
+            lambda: "取消收藏" if self._is_current_favorited() else "收藏当前歌曲")
+
+        self.btn_add_pl = self._make_icon_circle_btn(
+            right, "plus", lambda: self._add_current_to_playlist(),
+            diameter=38)
+        self.btn_add_pl.pack(side="left")
+        self._bind_tooltip(self.btn_add_pl, "添加到歌单")
 
         # ★ 音量控制行：喇叭图标 + 百分比 + 滑块（默认隐藏，可点头部按钮切换）
         vol_row = tk.Frame(f1, bg=self.BG)
@@ -2264,7 +2538,12 @@ class ControlPanel:
                 self.lbl_player.image = new_photo
         except Exception:
             pass
-        
+        # ⑭ 收藏按钮爱心颜色跟随主题
+        try:
+            self._update_fav_btn_icon()
+        except Exception:
+            pass
+                
     def _recolor_widgets(self, widget, mapping):
         if not mapping:
             return
@@ -2298,6 +2577,9 @@ class ControlPanel:
     # ================= 播放控制 =================
     def _cmd(self, what):
         try:
+            if self._win_mode:
+                self._win_step(+1 if what == "next" else -1)
+                return
             if what == "prev":
                 if self._play_mode == "queue":
                     self.lms.prev_track_queue()
@@ -2317,9 +2599,340 @@ class ControlPanel:
             return
         self._last_play_press = now
         try:
+            if self._win_mode:
+                self.local_player.toggle()
+                self._playing = self.local_player.is_playing
+                return
             self.lms.command(["pause"])
         except Exception:
             traceback.print_exc()
+
+    # ========= 播放顺序 / 收藏 / 添加歌单 =========
+    # 只有两态：顺序播放 / 单曲循环。
+    # ★ 两者都不向 LMS 下发 repeat / shuffle，单曲循环完全由应用自己实现。
+    _PLAY_ORDER_SEQ = ("sequential", "repeat_one")
+
+    _PLAY_ORDER_TIPS = {
+        "sequential": "顺序播放",
+        "repeat_one": "单曲循环",
+    }
+    _PLAY_ORDER_ICONS = {
+        "sequential": "⇉",
+        "repeat_one": "↻",
+    }
+
+    def _play_order_tooltip(self):
+        return self._PLAY_ORDER_TIPS.get(self._play_order, "播放顺序")
+
+    def _cycle_play_mode(self):
+        try:
+            idx = self._PLAY_ORDER_SEQ.index(self._play_order)
+        except ValueError:
+            idx = 0
+        next_mode = self._PLAY_ORDER_SEQ[(idx + 1) % len(self._PLAY_ORDER_SEQ)]
+        self._set_play_order(next_mode)
+        return "break"
+
+    def _set_play_order(self, mode):
+        """切换播放顺序：纯本地状态，不下发任何 LMS 命令。
+
+           · 单曲循环 → 由 _repeat_one_tick() 在应用内实现：
+             当前曲目播完后，把 LMS 队列指针拉回本曲重放一次（再重新计时）；
+           · 顺序播放 → 取消单曲循环。"""
+        if mode not in self._PLAY_ORDER_SEQ:
+            mode = "sequential"
+        self._play_order = mode
+        self._repeat_one = (mode == "repeat_one")
+        self._ro_prev = None          # 丢弃旧快照，避免拿上一首的进度误判
+        self._ro_guard_until = 0.0
+        self._ro_hold_until = 0.0     # 取消可能残留的过渡期屏蔽
+        self._ro_hold_tid = ""
+        btn = getattr(self, "btn_play_order", None)
+        setter = getattr(btn, "set_icon", None)
+        if callable(setter):
+            setter("repeat_one" if mode == "repeat_one" else "repeat")
+        else:
+            self._update_btn_text(
+                btn, self._PLAY_ORDER_ICONS.get(mode, "⇉"))
+        print(f"[播放顺序] {self._play_order_tooltip()}（仅应用内生效）")
+
+    # ---------- 单曲循环（应用内实现，不下发 LMS repeat/shuffle） ----------
+    def _repeat_one_tick(self, st):
+        """当前曲目自然播完后重放它。判定依据：
+
+             · mode 由 play/pause 变成 stop，且上一轮已接近曲尾
+               → 单曲队列 / 队尾播完，LMS 停住；
+             · track_id 变了，且上一轮已接近曲尾
+               → 队列里还有后面的歌，LMS 自动跳到了下一首。
+
+           手动切歌（上一曲/下一曲/点歌）时，上一轮离曲尾还远，
+           因此不会被误判成「播完了」，不会把人拉回来。"""
+        if not getattr(self, "_repeat_one", False):
+            self._ro_prev = None
+            return
+        try:
+            mode = (st.get("mode") or "").strip()
+            tid = str(st.get("track_id") or "")
+            cur = float(st.get("time", 0) or 0)
+            dur = float(st.get("duration", 0) or 0)
+            idx = int(st.get("cur_index", -1))
+        except (TypeError, ValueError):
+            return
+
+        prev = self._ro_prev
+        self._ro_prev = (tid, cur, dur, mode, idx)
+
+        if prev is None:
+            return
+        if time.time() < self._ro_guard_until:
+            return
+
+        p_tid, p_time, p_dur, p_mode, p_idx = prev
+        if p_dur <= 0:
+            return
+        near_end = p_time >= p_dur - 2.0
+
+        stopped = (mode == "stop" and p_mode in ("play", "pause"))
+        advanced = bool(tid) and bool(p_tid) and tid != p_tid
+        if not near_end or not (stopped or advanced):
+            return
+
+        target = p_idx if p_idx >= 0 else idx
+        if target < 0:
+            return
+
+        # 防抖：重播后 2 秒内不再判定，避免命令往返期间重复触发
+        self._ro_guard_until = time.time() + 2.0
+        # 过渡期：这段时间内 LMS 可能还报着「下一曲」，界面继续显示本曲
+        self._ro_hold_until = time.time() + 1.2
+        self._ro_hold_tid = str(p_tid or "")
+        self.song_pos = 0.0
+        self._last_seek_target = None
+        self._seek_retried = False
+        print(f"[循环] 单曲循环：重播第 {target + 1} 首")
+        try:
+            if self._win_mode:
+                self._win_play_index(target)
+            else:
+                self.lms.command(["playlist", "index", str(target)])
+        except Exception as e:
+            print(f"[循环] 重播失败: {type(e).__name__}")
+
+    def _ro_hold_ui(self, tid):
+        """单曲循环重播的过渡期里，是否应当忽略本次状态快照的界面刷新。
+
+            LMS 在曲尾会先跳到下一首，应用再把它拉回来；这几十毫秒里
+            track_id 是「下一首」，若照常刷新界面就会闪现下一首的封面和歌名。
+            · 当前 tid 已经回到要重播的那首 → 立即解除保持并正常刷新；
+            · 仍在保持窗口内且 tid 不是那首 → 保持旧界面，等命令生效。"""
+        if not getattr(self, "_repeat_one", False):
+            return False
+        hold_tid = getattr(self, "_ro_hold_tid", "")
+        if hold_tid and str(tid or "") == hold_tid:
+            self._ro_hold_until = 0.0       # 已回到目标曲，解除
+            return False
+        return time.time() < getattr(self, "_ro_hold_until", 0.0)
+
+    def _update_btn_text(self, btn, text, fill=None):
+        """更新 _make_play_btn 返回按钮里的文字。兼容 Canvas 与普通控件。
+
+           ★ 必须调用 canvas.set_text()：它同时更新按钮内部的 state["text"]。
+             只改画布上的文字对象的话，鼠标移出（hover 重绘）时 redraw()
+             会按旧的 state["text"] 重画，图标就「变一下又跳回顺序播放」。"""
+        if btn is None:
+            return
+        try:
+            if isinstance(btn, tk.Canvas):
+                setter = getattr(btn, "set_text", None)
+                if callable(setter):
+                    setter(text)
+                    return
+                for item in btn.find_all():
+                    if btn.type(item) == "text":
+                        kw = {"text": text}
+                        if fill is not None:
+                            kw["fill"] = fill
+                        btn.itemconfig(item, **kw)
+                        return
+            else:
+                kw = {"text": text}
+                if fill is not None:
+                    kw["fg"] = fill
+                btn.config(**kw)
+        except Exception:
+            pass
+
+    # ---- 收藏当前歌曲 ----
+    def _current_fav_mac(self):
+        """收藏 / 歌单的统一归属键：必须与「收藏」「歌单」页一致 ——
+           使用达菲主机 MAC（HOST_MAC），而不是播放器 MAC。
+
+           历史 bug：这里曾返回 cfg.PLAYER_MAC（绝大多数情况下为空串），
+           播放页收藏就写进了 "" 桶，收藏页读的却是 HOST_MAC 桶，
+           于是「看起来收藏成功、收藏页却永远为空」。"""
+        return self._get_current_host_mac()
+
+    def _current_track_id(self):
+        ti = self.track_info or {}
+        return (ti.get("track_id") or ti.get("id")
+                or ti.get("trackId") or ti.get("trackid") or "")
+
+    def _is_current_favorited(self):
+        tid = str(self._current_track_id() or "")
+        if not tid:
+            return False
+        return self._is_favorite(tid)
+
+    def _toggle_current_fav(self):
+        ti = self.track_info or {}
+        tid = self._current_track_id()
+        if not tid:
+            return "break"
+
+        # 与收藏页共用同一份数据、同一套刷新逻辑（按 HOST_MAC 分组）
+        self._toggle_favorite(
+            tid,
+            ti.get("title", ""), ti.get("artist", ""), ti.get("album", ""))
+
+        self._update_fav_btn_icon()
+        return "break"
+
+    def _update_fav_btn_icon(self):
+        is_fav = self._is_current_favorited()
+        btn = getattr(self, "btn_fav_current", None)
+        if btn is None:
+            return
+        setter = getattr(btn, "set_icon", None)
+        if callable(setter):
+            # ★ 已收藏 = 红心（不随深浅主题变黑）
+            setter("heart", "#FF3B30") if is_fav else setter("heart_off")
+            return
+        try:
+            btn.config(text="♥" if is_fav else "♡",
+                       fg="#FF3B30" if is_fav else self.DIM, bg=self.BG)
+        except Exception:
+            pass
+
+    # ---- 添加到歌单 ----
+    def _add_current_to_playlist(self):
+        """播放页「+」按钮：弹出与歌曲右键同款的歌单菜单
+           （仅歌单相关项，不含「添加/取消收藏」）。"""
+        tid = str(self._current_track_id() or "")
+        if not tid:
+            return "break"
+
+        ti = self.track_info or {}
+        title = ti.get("title", "") or ""
+        artist = ti.get("artist", "") or ""
+        album = ti.get("album", "") or ""
+
+        # ★ 必须走 HOST_MAC 分组（与「歌单」页同一份数据）；
+        #   过去用 PLAYER_MAC 取，桶永远为空 → 点了没反应
+        playlists = self._get_playlists_for_current()
+
+        items = []
+        pl_items = []
+        for pl in playlists:
+            if isinstance(pl, dict) and pl.get("name"):
+                pl_name = pl["name"]
+                pl_items.append({
+                    "label": pl_name,
+                    "icon": "list",
+                    "command": (lambda pn=pl_name: self._add_from_menu_to_playlist(
+                        pn, tid, title, artist, album)),
+                })
+
+        if pl_items:
+            items.append({"header": "添加到歌单"})
+            items.extend(pl_items)
+        else:
+            items.append({"label": "暂无歌单", "icon": "list",
+                          "enabled": False})
+
+        items.append("sep")
+        items.append({
+            "label": "新建歌单",
+            "icon": "plus",
+            "command": lambda: self._add_to_new_playlist(
+                tid, title, artist, album),
+        })
+
+        # 菜单锚在按钮下方；延后 10ms 弹出，避免本次 <Button-1>
+        # 立刻命中菜单的「点击外部关闭」全局监听
+        try:
+            x = self.btn_add_pl.winfo_rootx()
+            y = (self.btn_add_pl.winfo_rooty()
+                 + self.btn_add_pl.winfo_height() + 2)
+        except tk.TclError:
+            return "break"
+
+        anchor = _MenuAnchor(x, y)
+        try:
+            self.panel.after(
+                10, lambda: self._show_popup_menu(anchor, items, min_w=110))
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _add_from_menu_to_playlist(self, pl_name, tid, title, artist, album):
+        """菜单里选中某个歌单 → 写库 + 给「+」按钮一个短暂 ✓ 反馈。"""
+        self._add_to_playlist(pl_name, tid, title, artist, album)
+        self._flash_add_pl_ok()
+
+    def _flash_add_pl_ok(self):
+        """「+」按钮短暂变成 ✓，0.9 秒后恢复，让操作有可见反馈。"""
+        btn = getattr(self, "btn_add_pl", None)
+        setter = getattr(btn, "set_icon", None)
+        if callable(setter):
+            setter("check")
+
+            def restore2():
+                try:
+                    setter("plus")
+                except tk.TclError:
+                    pass
+            try:
+                self.panel.after(900, restore2)
+            except tk.TclError:
+                pass
+            return
+        try:
+            btn.config(text="✓", fg=self.ACCENT)
+        except Exception:
+            return
+
+        def restore():
+            try:
+                btn.config(text="+", fg=self.DIM)
+            except tk.TclError:
+                pass
+        try:
+            self.panel.after(900, restore)
+        except tk.TclError:
+            pass
+
+    # ---- 周期性刷新（切歌后爱心自动跟随）----
+    def _maybe_refresh_current_buttons(self):
+        ti = self.track_info or {}
+        tid = str(ti.get("id") or ti.get("track_id") or "")
+        if getattr(self, "_last_fav_check_track_id", None) == tid:
+            return
+        self._last_fav_check_track_id = tid
+        try:
+            self._update_fav_btn_icon()
+        except Exception:
+            pass
+
+    def _refresh_current_buttons_periodic(self):
+        try:
+            self._maybe_refresh_current_buttons()
+        except Exception:
+            pass
+        try:
+            self.panel.after(500, self._refresh_current_buttons_periodic)
+        except tk.TclError:
+            pass
+
     # ================= 尺寸跟踪（程序 vs 用户）=================
     def _enable_resize_tracking(self):
         """初始化完成后启用用户 resize 跟踪。"""
@@ -2937,6 +3550,13 @@ class ControlPanel:
             btn_bg=self.CARD, font_size=9)
         self.btn_reset.pack(side="left")
 
+        # ★ 本地音乐：位置在「恢复默认」右边
+        self.btn_local_music = self._make_round_btn(
+            r4, "本地音乐", self._open_local_music_dialog,
+            width=86, height=24, radius=8,
+            btn_bg=self.CARD, font_size=9)
+        self.btn_local_music.pack(side="left", padx=(8, 0))
+
         self.btn_about = self._make_round_btn(
             r4, "关于", self._show_about,
             width=72, height=24, radius=8,
@@ -3049,7 +3669,10 @@ class ControlPanel:
     def _on_volume(self, val):
         try:
             v = int(float(val))
-            self.lms.command(["mixer", "volume", str(v)])
+            if self._win_mode:
+                self.local_player.set_volume(v)
+            else:
+                self.lms.command(["mixer", "volume", str(v)])
         except Exception:
             v = None
         if v is not None:
@@ -3134,7 +3757,10 @@ class ControlPanel:
 
                 def work(p=pos):
                     try:
-                        self.lms.seek(p)
+                        if self._win_mode:
+                            self.local_player.seek(p)
+                        else:
+                            self.lms.seek(p)
                     except Exception:
                         traceback.print_exc()
                 threading.Thread(target=work, daemon=True).start()
@@ -3282,8 +3908,33 @@ class ControlPanel:
             traceback.print_exc()
 
     # ================= 播放器切换与监控 =================
+    def _apply_header_visibility(self):
+        """本地模式（无达菲）时隐藏左上角三个达菲相关按钮；
+           连上达菲后再按原样放回最左侧。"""
+        offline = bool(getattr(self.lms, "is_offline", False))
+        for w in (getattr(self, "btn_daphile_settings", None),
+                  getattr(self, "btn_server_web", None),
+                  getattr(self, "btn_player_icon", None)):
+            if w is None:
+                continue
+            try:
+                if offline:
+                    w.pack_forget()
+                else:
+                    w.pack(side="left", padx=(0, 2))
+            except tk.TclError:
+                pass
+        self._header_offline = offline
+
     def _update_players(self, players):
         self._available_players = players
+
+        if self._win_mode:
+            try:
+                self.lbl_player.config(text=" Windows 扬声器 ▼", fg=self.ACCENT)
+            except Exception:
+                pass
+            return
 
         current_mac = self.lms.player_mac()
         current_name = ""
@@ -3320,12 +3971,17 @@ class ControlPanel:
             
     def _show_players_menu(self, event):
         current_mac = self.lms.player_mac()
-        items = []
+        items = [{
+            "label": "Windows 扬声器",
+            "icon": "check" if self._win_mode else "speaker",
+            "command": self._switch_to_windows_speaker,
+        }]
+        items.append("sep")
         if not self._available_players:
-            items.append({"label": "暂无可用播放器", "enabled": False})
+            items.append({"label": "暂无达菲播放器", "enabled": False})
         else:
             for mac, name in self._available_players:
-                is_cur = (mac == current_mac)
+                is_cur = (mac == current_mac) and not self._win_mode
                 items.append({
                     "label": name,
                     "icon": "check" if is_cur else "speaker",
@@ -3334,7 +3990,51 @@ class ControlPanel:
                 })
         self._show_popup_menu(event, items, min_w=130)
 
+    def _switch_to_windows_speaker(self):
+        """切到本机声卡播放：随后所有歌曲（本地文件 / 达菲曲目）都在电脑上出声。"""
+        if self._win_mode:
+            return
+        if not HAS_AUDIO:
+            self._lib_set_status(
+                "本机音频引擎不可用（缺少 vendor/miniaudio），无法使用 Windows 扬声器")
+            return
+        self._win_mode = True
+        self.cfg.LOCAL_SPEAKER = True
+        try:
+            self.cfg.save()
+        except Exception:
+            pass
+        # ★ 切换只改「输出目标」，绝不动达菲的播放状态：
+        #   LMS 的 pause 是「切换」语义，对着已暂停的播放器发一次就会把它放出来，
+        #   所以这里一条命令都不发（正在播放的继续播，暂停的继续暂停）。
+        try:
+            self.local_player.set_volume(int(float(self.scl_vol.get())))
+        except Exception:
+            pass
+        try:
+            self.lbl_player.config(text=" Windows 扬声器 ▼", fg=self.ACCENT)
+        except Exception:
+            pass
+        self._lib_set_status("已切换到 Windows 扬声器（之后的歌曲在电脑上播放）")
+        print("[播放器] 切换到 Windows 扬声器（未改动达菲播放状态）")
+
+    def _current_volume_pct(self):
+        try:
+            return int(float(self.scl_vol.get()))
+        except Exception:
+            return 50
+
     def _on_player_changed(self, mac, name):
+        # ★ 只切换输出目标，不动任何正在播放的声音：
+        #   本机在播的继续播，达菲在播的继续播（切换不暂停、也不开始播放）
+        if self._win_mode:
+            self._win_mode = False
+            self.cfg.LOCAL_SPEAKER = False
+            try:
+                self.cfg.save()
+            except Exception:
+                pass
+            print("[播放器] 切回达菲播放器（本机正在播的不会被暂停）")
         if mac == self.lms.player_mac():
             return
 
@@ -3358,6 +4058,10 @@ class ControlPanel:
         self._lyrics_source = ""
         self.track_info = {}
         self._vol_set = False
+        self._ro_prev = None            # 切换播放器后旧的轮询快照不再有效
+        self._ro_guard_until = 0.0
+        self._ro_hold_until = 0.0
+        self._ro_hold_tid = ""
 
     def _open_lms_web(self, _e=None):
         if getattr(self, "lms", None) and getattr(self.lms, "host", ""):
@@ -3678,11 +4382,25 @@ class ControlPanel:
         last_track = None
         while not self._stop:
             try:
-                st = self.lms.get_status()
+                if self._win_mode:
+                    st = self._win_status()
+                else:
+                    st = self.lms.get_status()
+                    # ★ 达菲在放本机推流时，用本地标签修正歌名/歌手/专辑
+                    self._apply_pushed_meta(st)
+                # ★ 单曲循环（应用内）：曲目自然播完就拉回本曲重放
+                self._repeat_one_tick(st)
+                # ★ 重播过渡期：LMS 已经跳到下一首、命令还没生效的这几十毫秒里，
+                #   不要用下一首的封面/歌名刷新界面（否则会闪一下）
+                hold_ui = self._ro_hold_ui(st.get("track_id"))
                 # ★ grace 期 1.5s
                 in_grace = (time.time() - self._last_seek_ts) <= 1.5
+                # ★ 正在拖动进度条（还没松手）：此时界面必须完全跟随手指，
+                #   不能再拿 LMS 的播放位置覆盖 song_pos，否则时间点会被
+                #   「拉回」原位置（歌正好在开头时就表现为跳到 00:00）
+                seeking = getattr(self, "_seeking", False)
 
-                if not in_grace:
+                if not in_grace and not seeking:
                     lms_time = float(st.get("time", 0) or 0)
                     mode = st.get("mode", "") or ""
 
@@ -3725,6 +4443,12 @@ class ControlPanel:
                                 self.song_pos = lms_time
                                 self._last_seek_target = None
                                 self._seek_retried = False
+                            elif abs(diff) > 3.0:
+                                # ★ 保护期都过了 LMS 还差这么远 → seek 没生效/跨曲，
+                                #   直接采用 LMS 值（不要慢慢爬回旧位置）
+                                self.song_pos = lms_time
+                                self._last_seek_target = None
+                                self._seek_retried = False
                             elif diff > 0:
                                 # LMS 超前 → 平滑前进 0.3s/帧，视觉无跳变
                                 self.song_pos += min(0.3, diff)
@@ -3758,40 +4482,33 @@ class ControlPanel:
                 #       （只冻结，等 LMS 以 1x 推进追上，绝不回退）
                 #     · LMS 超前 → 跟随 LMS
                 #     · LMS 异常落后（gap > 3s）→ seek 失败 / 跨曲，放弃推算
-                elif self._playing and self._last_seek_target is not None:
+                elif (not seeking) and self._playing \
+                        and self._last_seek_target is not None:
                     lms_time_now = float(st.get("time", 0) or 0)
-                    gap = self._last_seek_target - lms_time_now
-                    if gap > 3.0:
-                        # seek 失败 / 跨曲：LMS 落点与目标差距过大，放弃推算
+                    target = self._last_seek_target
+                    if abs(lms_time_now - target) <= 2.0:
+                        # ★ LMS 已经跳到目标附近 → 清掉目标，恢复正常跟随
+                        self.song_pos = max(lms_time_now, target)
+                        self._last_seek_target = None
+                        self._seek_retried = False
+                    elif time.time() - self._last_seek_ts > 4.0:
+                        # 超时（seek 失败 / 跨曲）→ 采用 LMS 的值
                         self.song_pos = lms_time_now
                         self._last_seek_target = None
                         self._seek_retried = False
                     else:
-                        # ★ 全程只前进，不冻结、不回退：
-                        #     derived  = target + 0.5 × elapsed
-                        #     song_pos = max(derived, lms_time)
-                        #
-                        #   · LMS 未响应（lms_time 还是旧值）→ derived 主导（0.5x 缓滚）
-                        #   · LMS 响应但落后 → lms_time < derived → derived 主导
-                        #     （高亮继续缓滚，LMS 慢慢追上来，无冻结）
-                        #   · LMS 追上 / 超前 → lms_time ≥ derived → LMS 主导（1x）
-                        #
-                        #   这样速度从 0.5x 平滑过渡到 1x，彻底消除「跟 0.2s →
-                        #   冻结 0.2s → 再跟」的暂停感。
-                        elapsed = time.time() - self._last_seek_ts
-                        derived = self._last_seek_target + elapsed * 0.5
-                        if self._duration and self._duration > 0:
-                            derived = min(self._duration, derived)
-                        if derived > self.song_pos:
-                            self.song_pos = derived
-                        if lms_time_now > self.song_pos:
-                            self.song_pos = lms_time_now
+                        # ★ LMS 还没跳过去（这一两轮仍报旧位置）：
+                        #   进度条钉在拖动目标处，绝不回弹。
+                        #   （旧代码这里会把 LMS 的旧位置写回 song_pos，
+                        #     于是松手后先弹回原位、再跳到目标 → 就是那个 bug）
+                        self.song_pos = target
 
                 # ★ 关键：每轮都要从 LMS 刷新总时长
                 #   上一轮改写 grace 分支时漏掉了这一行 → _duration 恒为 0 →
                 #   进度条 to=1.0 被卡死、_seek_end 里 if self._duration 恒为 False
                 #   导致拖动进度条后根本不发 seek
-                self._duration = st.get("duration", 0.0)
+                if not hold_ui:
+                    self._duration = st.get("duration", 0.0)
 
                 # seek 保护期：如果本地是暂停态，忽略 LMS 瞬时的 "play" 通知，
                 # 避免播放/暂停按钮闪烁、避免误判为已播放
@@ -3812,9 +4529,16 @@ class ControlPanel:
                 tid = st.get("track_id")
                 if tid != last_track:
                     last_track = tid
-                    self.track_info = st
-                    self._start_fetch(st)
-                self._update_cover(st)
+                    # ★ 单曲循环重播的过渡期：不要用「下一曲」的信息刷 UI
+                    if not hold_ui:
+                        same_track = (str((self.track_info or {}).get(
+                            "track_id") or "") == str(tid or ""))
+                        self.track_info = st
+                        # 同一首重播（单曲循环）不必重新抓歌词，避免歌词空白一瞬
+                        if not same_track:
+                            self._start_fetch(st)
+                if not hold_ui:
+                    self._update_cover(st)
 
                 now = time.time()
                 if now - self._last_players_check > 5.0:
@@ -3841,11 +4565,27 @@ class ControlPanel:
             return
 
         def work():
-            try:
-                src, lrc = self.fetcher.fetch(track_id, st.get("artist", ""), st.get("title", ""), st.get("album", ""), st.get("duration", 0))
-            except Exception:
-                traceback.print_exc()
-                src, lrc = "未找到", ""
+            if is_local_id(track_id):
+                # ★ 本地曲目：先找 .lrc / 内嵌歌词，再退回在线搜索
+                try:
+                    src, lrc = "本地歌词", (self.local_lib.read_lyrics(track_id) or "")
+                except Exception:
+                    src, lrc = "", ""
+                if not lrc:
+                    try:
+                        text = self.fetcher._t_lrclib(
+                            st.get("artist", ""), st.get("title", ""),
+                            st.get("album", ""))
+                        if text:
+                            src, lrc = "LRCLIB在线", text
+                    except Exception:
+                        pass
+            else:
+                try:
+                    src, lrc = self.fetcher.fetch(track_id, st.get("artist", ""), st.get("title", ""), st.get("album", ""), st.get("duration", 0))
+                except Exception:
+                    traceback.print_exc()
+                    src, lrc = "未找到", ""
 
             def apply():
                 if token != self._fetch_token:
@@ -3891,6 +4631,11 @@ class ControlPanel:
     def _update_cover(self, st):
         cover_id = str(st.get("coverid", "") or "").strip()
         track_id = str(st.get("track_id", "") or "").strip()
+
+        # ★ 本地音乐：封面来自内嵌图片，不走 LMS
+        if is_local_id(track_id):
+            self._show_local_cover(track_id)
+            return
 
         if cover_id and cover_id not in ("0", "-"):
             key = "c:" + cover_id
@@ -4215,6 +4960,585 @@ class ControlPanel:
         if 0 <= i < len(self.lines): return self.lines[i][1]
         return ""
 
+    # ================= 本地音乐 / Windows 扬声器 =================
+    def _win_current(self):
+        if 0 <= self._win_idx < len(self._win_queue):
+            return self._win_queue[self._win_idx]
+        return None
+
+    def _win_status(self):
+        """把本机播放器包装成和 LMS 一样的状态字典，界面代码无需改动。"""
+        lp = self.local_player
+        item = self._win_current()
+        if not item:
+            return {"mode": "stop", "time": 0.0, "duration": 0.0,
+                    "track_id": None, "title": "", "artist": "", "album": "",
+                    "coverid": "", "volume": lp.volume,
+                    "queue": [], "cur_index": -1}
+        if lp.is_playing:
+            mode = "play"
+        elif lp.finished:
+            mode = "stop"
+        else:
+            mode = "pause"
+        queue = [{"pos": i, "id": q.get("id"),
+                  "title": q.get("title", ""),
+                  "album_id": q.get("album", ""),
+                  "artist_id": q.get("artist", ""),
+                  "tracknum": i + 1}
+                 for i, q in enumerate(self._win_queue)]
+        return {
+            "mode": mode,
+            "time": lp.position(),
+            "duration": item.get("duration") or lp.duration,
+            "track_id": item.get("id"),
+            "title": item.get("title", ""),
+            "artist": item.get("artist", ""),
+            "album": item.get("album", ""),
+            "coverid": "",
+            "volume": lp.volume,
+            "queue": queue,
+            "cur_index": self._win_idx,
+        }
+
+    def _win_step(self, step):
+        if not self._win_queue:
+            return
+        idx = (self._win_idx + step) % len(self._win_queue)
+        self._win_play_index(idx)
+
+    def _win_play_index(self, idx):
+        if not (0 <= idx < len(self._win_queue)):
+            return
+        self._win_idx = idx
+        item = self._win_queue[idx]
+        self._lib_last_synced_track = str(item.get("id"))
+        if item.get("kind") == "local":
+            self._win_start_local(item)
+        else:
+            self._win_start_lms(item)
+
+    def _win_start_local(self, item):
+        path = item.get("path") or ""
+        if not os.path.isfile(path):
+            self._lib_set_status(f"文件不存在：{path}")
+            return
+        # ★ 本机引擎只认 FLAC/MP3/WAV/OGG；其它格式先想办法解码
+        if not self._local_playable(path):
+            self._win_decode_external(item)
+            return
+        try:
+            self.local_player.load(path)
+        except Exception as e:
+            self._lib_set_status(
+                f"无法播放（{type(e).__name__}）：{os.path.basename(path)}")
+            return
+        self.local_player.set_volume(self._current_volume_pct())
+        self.local_player.play()
+        self._local_cover_key = ""
+        self._current_cover_id = ""
+        self._lib_set_status(f"正在播放: {item.get('title', '')}")
+
+    def _win_start_lms(self, item):
+        """达菲曲目 → 先取回本机缓存，再本地播放。"""
+        tid = str(item.get("id") or "")
+        if not tid:
+            return
+        self._lib_set_status(f"正在从达菲取回：{item.get('title', '')}…")
+        title = item.get("title", "")
+
+        def work():
+            path = self._win_cached_path(tid)
+            if not path:
+                data = None
+                try:
+                    data = self.lms.download_track(tid, max_mb=120)
+                except Exception as e:
+                    print(f"[本机播放] 取回失败 {tid}: {type(e).__name__}")
+                if not data:
+                    try:
+                        self.panel.after(
+                            0, lambda: self._lib_set_status(
+                                f"取回失败：{title}（达菲未提供该曲目文件）"))
+                    except tk.TclError:
+                        pass
+                    return
+                path = self._win_write_cache(tid, data)
+            if not path:
+                return
+            try:
+                self.panel.after(
+                    0, lambda p=path: self._win_start_local(
+                        dict(item, kind="local", path=p)))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _win_cached_path(self, tid):
+        safe = "".join(ch for ch in str(tid) if ch.isalnum() or ch in "-_")
+        try:
+            os.makedirs(self._win_cache_dir, exist_ok=True)
+            for name in os.listdir(self._win_cache_dir):
+                if name.startswith(safe + "."):
+                    p = os.path.join(self._win_cache_dir, name)
+                    try:
+                        if os.path.getsize(p) > 4096:
+                            return p
+                    except OSError:
+                        pass
+        except OSError as e:
+            print(f"[本机播放] 缓存目录不可用: {e}")
+        return ""
+
+    def _win_write_cache(self, tid, data):
+        safe = "".join(ch for ch in str(tid) if ch.isalnum() or ch in "-_")
+        try:
+            from local_player import sniff_ext
+            ext = sniff_ext(data)
+        except Exception:
+            ext = ""
+        try:
+            os.makedirs(self._win_cache_dir, exist_ok=True)
+            path = os.path.join(self._win_cache_dir, safe + ext)
+            tmp = path + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+            return path
+        except OSError as e:
+            print(f"[本机播放] 写缓存失败: {e}")
+            return ""
+
+    def _win_queue_from_lib(self, selected_tid):
+        """当前「歌曲」列作为本机播放队列（达菲曲目按需取回）。"""
+        artist = getattr(self, "_lib_current_artist", "")
+        album = ""
+        sel = self.tree_albums.selection()
+        if sel:
+            info = self._lib_albums.get(sel[0])
+            if info:
+                album = info[1]
+        queue = []
+        for tid, title in list(self._lib_tracks.values()):
+            if is_local_id(tid):
+                t = self.local_lib.get(tid) or {}
+                queue.append({"kind": "local", "id": tid,
+                              "path": t.get("path", ""),
+                              "title": t.get("title", title),
+                              "artist": t.get("artist", artist),
+                              "album": t.get("album", album),
+                              "duration": t.get("duration", 0)})
+            else:
+                queue.append({"kind": "lms", "id": str(tid), "title": title,
+                              "artist": artist, "album": album,
+                              "duration": 0})
+        if not queue:
+            return
+        self._win_queue = queue
+        idx = next((i for i, q in enumerate(queue)
+                    if str(q.get("id")) == str(selected_tid)), 0)
+        self._win_play_index(idx)
+
+    @staticmethod
+    def _local_playable(path):
+        """本机引擎（miniaudio）能直接解码的扩展名。"""
+        return os.path.splitext(path)[1].lower() in (".mp3", ".flac",
+                                                     ".wav", ".ogg")
+
+    def _win_decode_external(self, item):
+        """miniaudio 不支持的格式：优先用内置 PyAV 解码，其次用 ffmpeg 转码。"""
+        path = item.get("path") or ""
+        ext = (os.path.splitext(path)[1].lower().lstrip(".") or "?").upper()
+        if HAS_AV_DECODER and decode_to_pcm is not None:
+            title = item.get("title", "")
+            self._lib_set_status(f"正在解码 {ext}：{title}…")
+
+            def work():
+                pcm = None
+                rate, ch, dur = 44100, 2, 0.0
+                try:
+                    pcm, rate, ch, dur = decode_to_pcm(path)
+                except Exception as e:
+                    print(f"[本机播放] PyAV 解码失败 {path}: "
+                          f"{type(e).__name__}: {e}")
+
+                def done():
+                    if not pcm:
+                        self._win_transcode_and_play(item, path)
+                        return
+                    try:
+                        self.local_player.load_pcm(pcm, rate, ch, dur, path)
+                        self.local_player.set_volume(
+                            self._current_volume_pct())
+                        self.local_player.play()
+                        self._local_cover_key = ""
+                        self._current_cover_id = ""
+                        self._lib_set_status(f"正在播放: {title}")
+                    except Exception as e:
+                        print(f"[本机播放] 内存 PCM 播放失败: {e}")
+                        self._lib_set_status(
+                            f"无法播放：{os.path.basename(path)}")
+                try:
+                    self.panel.after(0, done)
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._win_transcode_and_play(item, path)
+
+    def _win_transcode_and_play(self, item, path):
+        """APE / M4A / WMA 等本机引擎不支持的格式：有 ffmpeg 就转成 WAV 再播。"""
+        ext = (os.path.splitext(path)[1].lower().lstrip(".") or "?").upper()
+        ff = ""
+        app_dir = getattr(self, "_app_dir", "") or ""
+        if app_dir:
+            local_ff = os.path.join(app_dir, "ffmpeg.exe")
+            if os.path.isfile(local_ff):
+                ff = local_ff
+        if not ff:
+            ff = shutil.which("ffmpeg") or ""
+        if not ff:
+            self._lib_set_status(
+                f"{ext} 格式无法用本机引擎解码（支持 FLAC/MP3/WAV/OGG）："
+                f"把 ffmpeg.exe 放到程序目录（或装到 PATH）后即可本机播放，"
+                f"也可切到达菲设备扬声器播放")
+            return
+        safe = "".join(ch for ch in str(item.get("id") or "")
+                       if ch.isalnum() or ch in "-_")
+        out_dir = os.path.join(self._win_cache_dir, "transcoded")
+        out = os.path.join(out_dir, (safe or "track") + ".wav")
+        if os.path.isfile(out) and os.path.getsize(out) > 4096:
+            self._win_start_local(dict(item, path=out))
+            return
+        self._lib_set_status(
+            f"正在转换 {ext} → WAV：{item.get('title', '')}…")
+
+        def work():
+            ok = False
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                tmp = out + ".part.wav"
+                subprocess.run(
+                    [ff, "-y", "-loglevel", "error", "-i", path, "-vn",
+                     "-ac", "2", "-ar", "44100", tmp],
+                    capture_output=True, timeout=900)
+                if os.path.isfile(tmp) and os.path.getsize(tmp) > 4096:
+                    os.replace(tmp, out)
+                    ok = True
+            except Exception as e:
+                print(f"[本机播放] 转码失败: {type(e).__name__}: {e}")
+
+            def done():
+                if ok:
+                    self._win_start_local(dict(item, path=out))
+                else:
+                    self._lib_set_status(
+                        f"转码失败：{os.path.basename(path)}（请确认 ffmpeg 可用）")
+            try:
+                self.panel.after(0, done)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _play_local_track(self, tid, tname=""):
+        """在 Windows 扬声器上播放本地曲目（整张专辑排队）。"""
+        if not HAS_AUDIO:
+            self._lib_set_status("本机音频引擎不可用，无法播放本地音乐")
+            return
+        t = self.local_lib.get(tid)
+        if not t:
+            self._lib_set_status(f"本地曲目已失效：{tname}")
+            return
+        tracks = self.local_lib.tracks_of(t["artist"], t["album"]) or [t]
+        self._win_queue = [{
+            "kind": "local", "id": x["id"], "path": x["path"],
+            "title": x["title"], "artist": x["artist"],
+            "album": x["album"], "duration": x["duration"],
+        } for x in tracks]
+        idx = next((i for i, q in enumerate(self._win_queue)
+                    if str(q["id"]) == str(tid)), 0)
+        self._win_play_index(idx)
+
+    def _ensure_media_server(self):
+        if self._media_server is None:
+            try:
+                from media_server import MediaServer
+            except Exception as e:
+                print(f"[本地推流] 模块不可用: {e}")
+                return None
+            self._media_server = MediaServer(self.local_lib)
+        return self._media_server if self._media_server.start() else None
+
+    def _play_local_on_daphile(self, tid, tname=""):
+        """当前扬声器是达菲设备：把本地文件通过 HTTP 推给 LMS 拉流播放。"""
+        t = self.local_lib.get(tid)
+        if not t:
+            self._lib_set_status(f"本地曲目已失效：{tname}")
+            return
+        path = t.get("path") or ""
+        if not os.path.isfile(path):
+            self._lib_set_status(f"文件不存在：{path}")
+            return
+        srv = self._ensure_media_server()
+        if srv is None:
+            self._lib_set_status("本地推流服务启动失败，无法推送到达菲")
+            return
+        url = srv.url_for(tid, t.get("title", ""), t.get("ext", ""))
+        if not url:
+            self._lib_set_status(
+                "没找到本机局域网 IP，达菲无法访问电脑上的文件（请检查网络）")
+            return
+        self._lib_set_status(f"正在推送到达菲：{t.get('title', '')}…")
+        print(f"[本地推流] {url}")
+        self._pushed = {
+            "url": url,
+            "tid": str(tid),
+            "title": t.get("title", "") or "",
+            "artist": t.get("artist", "") or "",
+            "album": t.get("album", "") or "",
+            "duration": t.get("duration", 0) or 0,
+            "filename": os.path.basename(path),
+            "ts": time.time(),
+        }
+
+        def work():
+            ok = True
+            try:
+                self.lms.command(["playlist", "play", url])
+            except Exception as e:
+                ok = False
+                print(f"[本地推流] 推送失败: {type(e).__name__}: {e}")
+            try:
+                self.panel.after(0, lambda: self._lib_set_status(
+                    f"已在达菲播放：{t.get('title', '')}" if ok
+                    else "推送到达菲失败：达菲无法访问本机推送地址"))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_pushed_meta(self, st):
+        """达菲在放本机推流时 LMS 只把 URL 当歌名 —— 用本地标签覆盖回来。"""
+        pushed = getattr(self, "_pushed", None)
+        if not pushed:
+            return
+        url = str(st.get("url") or "")
+        title = str(st.get("title") or "")
+        hit = False
+        if url and url == pushed.get("url"):
+            hit = True
+        elif "/local/" in url or "/local/" in title:
+            hit = True
+        elif title and title in (pushed.get("title"), pushed.get("filename")):
+            hit = True
+        if not hit:
+            if time.time() - (pushed.get("ts") or 0) > 8.0:
+                self._pushed = None
+            return
+        if pushed.get("title"):
+            st["title"] = pushed["title"]
+        st["artist"] = pushed.get("artist", "")
+        st["album"] = pushed.get("album", "")
+        st["track_id"] = pushed.get("tid")
+        if pushed.get("duration"):
+            st["duration"] = pushed["duration"]
+
+    def _show_local_cover(self, tid):
+        """本地曲目封面：读内嵌图片。"""
+        key = "l:" + str(tid)
+        if key == self._local_cover_key:
+            return
+        self._local_cover_key = key
+        self._current_cover_id = key
+        photo = self._cover_cache.get(key)
+        if photo is not None:
+            self.panel.after(0, lambda p=photo: self._set_cover_image(p))
+            return
+        self.panel.after(0, self._draw_default_cover)
+        if not HAS_PIL:
+            return
+
+        def work():
+            try:
+                data = self.local_lib.read_cover(tid)
+            except Exception:
+                data = None
+            if not data:
+                return
+            try:
+                img = Image.open(BytesIO(data)).convert("RGB")
+                img.thumbnail((144, 144))
+                photo2 = ImageTk.PhotoImage(img)
+            except Exception:
+                return
+            self._cover_cache[key] = photo2
+            try:
+                self.panel.after(
+                    0, lambda p=photo2: self._set_cover_image(p))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- 文件夹设置 ----------
+    def _local_music_summary(self):
+        folders = len(getattr(self.cfg, "LOCAL_FOLDERS", []) or [])
+        if not folders:
+            return "未添加文件夹"
+        return f"已收录 {self.local_lib.count()} 首 · {folders} 个文件夹"
+
+    def _start_local_scan(self, progress_cb=None, done_cb=None):
+        if self._win_scan_busy:
+            return
+        self._win_scan_busy = True
+
+        def work():
+            n = -1
+            try:
+                n = self.local_lib.scan(progress=progress_cb)
+            except Exception as e:
+                print(f"[本地音乐] 扫描异常: {type(e).__name__}: {e}")
+            self._win_scan_busy = False
+            if done_cb:
+                try:
+                    self.panel.after(0, lambda: done_cb(n))
+                except tk.TclError:
+                    pass
+            else:
+                try:
+                    self.panel.after(0, lambda: self._lib_show_artists())
+                except tk.TclError:
+                    pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_local_music_dialog(self):
+        dlg = tk.Toplevel(self.panel)
+        dlg.title("本地音乐")
+        dlg.configure(bg=self.BG)
+        dlg.resizable(False, False)
+        W, H = 520, 380
+
+        tk.Label(dlg, text="本地音乐文件夹", bg=self.BG, fg=self.FG,
+                 font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(14, 2))
+        tk.Label(dlg,
+                 text="添加电脑上的音乐文件夹后点「开始扫描」；"
+                      "扫到的歌曲会出现在「歌手」/「专辑」里，"
+                      "并可用「Windows 扬声器」在电脑上播放。",
+                 bg=self.BG, fg=self.DIM, justify="left",
+                 wraplength=W - 48,
+                 font=("Microsoft YaHei UI", 9)).pack(fill="x", padx=24)
+
+        body = tk.Frame(dlg, bg=self.BG)
+        body.pack(fill="both", expand=True, padx=24, pady=(10, 6))
+        list_wrap = tk.Frame(body, bg=self.CARD,
+                             highlightbackground=self.SEL_BG,
+                             highlightthickness=1)
+        list_wrap.pack(fill="both", expand=True)
+        lb = tk.Listbox(list_wrap, bg=self.CARD, fg=self.FG, relief="flat",
+                        highlightthickness=0, height=8,
+                        selectbackground=self.ACCENT, selectforeground="#FFFFFF",
+                        activestyle="none")
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        for f in (getattr(self.cfg, "LOCAL_FOLDERS", []) or []):
+            lb.insert("end", f)
+
+        status = tk.Label(dlg, text=self._local_music_summary(), bg=self.BG,
+                          fg=self.DIM, font=("Microsoft YaHei UI", 9),
+                          anchor="w")
+        status.pack(fill="x", padx=24)
+
+        btns = tk.Frame(dlg, bg=self.BG)
+        btns.pack(fill="x", padx=24, pady=(6, 12))
+
+        def save_folders():
+            folders = [f for f in lb.get(0, "end") if f]
+            self.cfg.LOCAL_FOLDERS = folders
+            try:
+                self.cfg.save()
+            except Exception:
+                pass
+            self.local_lib.set_folders(folders)
+            try:
+                status.config(text=self._local_music_summary())
+            except Exception:
+                pass
+            return folders
+
+        def add_folder():
+            p = filedialog.askdirectory(parent=dlg, title="选择音乐文件夹")
+            if not p:
+                return
+            p = os.path.normpath(p)
+            if p not in lb.get(0, "end"):
+                lb.insert("end", p)
+            save_folders()
+
+        def remove_folder():
+            for i in reversed(lb.curselection()):
+                lb.delete(i)
+            save_folders()
+
+        def rescan():
+            save_folders()
+            if self._win_scan_busy:
+                status.config(text="正在扫描…（已有一个扫描在跑）")
+                return
+            if not lb.get(0, "end"):
+                status.config(text="请先添加至少一个文件夹")
+                return
+            status.config(text="正在扫描…")
+
+            def progress(done, total, path):
+                if done == total or done % 20 == 0:
+                    try:
+                        dlg.after(0, lambda d=done, t=total: status.config(
+                            text=f"正在扫描… {d}/{t}"))
+                    except Exception:
+                        pass
+
+            def finished(n):
+                try:
+                    status.config(text=self._local_music_summary())
+                except Exception:
+                    pass
+                try:
+                    self._lib_show_artists()
+                except Exception:
+                    pass
+
+            self._start_local_scan(progress_cb=progress, done_cb=finished)
+
+        b_add = self._make_round_btn(btns, "添加文件夹", add_folder,
+                                     width=96, height=24, radius=8,
+                                     btn_bg=self.ACCENT, btn_fg="#FFFFFF",
+                                     font_size=9)
+        b_add.pack(side="left")
+        b_del = self._make_round_btn(btns, "删除所选", remove_folder,
+                                     width=86, height=24, radius=8,
+                                     btn_bg=self.CARD, font_size=9)
+        b_del.pack(side="left", padx=(8, 0))
+        b_scan = self._make_round_btn(btns, "开始扫描", rescan,
+                                      width=86, height=24, radius=8,
+                                      btn_bg=self.CARD, font_size=9)
+        b_scan.pack(side="left", padx=(8, 0))
+        b_close = self._make_round_btn(btns, "关闭", dlg.destroy,
+                                       width=72, height=24, radius=8,
+                                       btn_bg=self.CARD, font_size=9)
+        b_close.pack(side="right")
+
+        try:
+            self._prepare_dialog(dlg, W, H)
+        except Exception:
+            pass
+        dlg.protocol("WM_DELETE_WINDOW", lambda: (save_folders(), dlg.destroy()))
+
     # ================= 音乐库（三列） =================
     def _lib_set_status(self, text):
         self.lbl_lib.config(text=text)
@@ -4307,19 +5631,55 @@ class ControlPanel:
             except Exception as e:
                 print(f"[音乐库] {e}")
                 data = []
-            self.panel.after(0, lambda: self._lib_fill_artists(data, token))
+            local = []
+            try:
+                local = self.local_lib.artists()
+            except Exception:
+                local = []
+            self.panel.after(
+                0, lambda: self._lib_fill_artists(data, token, local))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _lib_fill_artists(self, artists, token):
+    def _lib_fill_artists(self, artists, token, local_artists=None):
         if token != self._lib_artist_token: return
         self._lib_clear_artists()
-        for a in artists:
-            aid, aname = a
-            iid = f"ar{aid}"
-            self.tree_artists.insert("", "end", iid=iid, text=aname, image=self._make_icon("artist"))
-            self._lib_artists[iid] = (str(aid), aname)
-        self._lib_set_status(f"共 {len(artists)} 位艺人 · 单击查看专辑")
+
+        # ① 合并：同名歌手只保留一行，标出本地库里是否也有
+        merged = {}
+        for a in artists or []:
+            try:
+                aid, aname = a
+            except Exception:
+                continue
+            k = str(aname or "").strip().lower()
+            if not k:
+                continue
+            merged.setdefault(k, {"name": aname, "aid": str(aid),
+                                  "local": False})
+        local_count = 0
+        for name, cnt in (local_artists or []):
+            k = str(name or "").strip().lower()
+            if not k:
+                continue
+            local_count += int(cnt or 0)
+            if k in merged:
+                merged[k]["local"] = True
+            else:
+                merged[k] = {"name": name, "aid": "", "local": True}
+
+        rows = sorted(merged.values(), key=lambda x: str(x["name"]).lower())
+        icon = self._make_icon("artist")
+        for i, row in enumerate(rows):
+            iid = f"ar{i}"
+            text = row["name"]          # ★ 歌手名后不加「· 本地」
+            kw = {"image": icon} if icon is not None else {}
+            self.tree_artists.insert("", "end", iid=iid, text=text, **kw)
+            self._lib_artists[iid] = (row["aid"], row["name"])
+
+        extra = f" · 本地 {local_count} 首" if local_count else ""
+        self._lib_set_status(
+            f"共 {len(rows)} 位艺人{extra} · 单击查看专辑")
         # ★ 若点击歌手名触发了加载，填充完成后自动选中
         pending = getattr(self, "_pending_artist_select", None)
         if pending:
@@ -4344,33 +5704,67 @@ class ControlPanel:
         self._lib_clear_albums()
         self._lib_clear_tracks()
         self._set_headers("albums")
+        self._lib_current_artist = artist_name
         self._lib_set_status(f"加载 {artist_name} 的专辑…")
         token = self._lib_album_token = self._lib_album_token + 1
 
         def work():
+            data = []
+            if artist_id and not is_local_id(artist_id):
+                try:
+                    data = self.lms.browse_albums(artist_id)
+                except Exception as e:
+                    print(f"[音乐库] {e}")
+                    data = []
+            local = []
             try:
-                data = self.lms.browse_albums(artist_id)
-            except Exception as e:
-                print(f"[音乐库] {e}")
-                data = []
-            self.panel.after(0, lambda: self._lib_fill_albums(data, artist_name, token))
+                local = self.local_lib.albums(artist_name)
+            except Exception:
+                local = []
+            self.panel.after(
+                0, lambda: self._lib_fill_albums(
+                    data, artist_name, token, local))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _lib_fill_albums(self, albums, artist_name, token):
+    def _lib_fill_albums(self, albums, artist_name, token, local_albums=None):
         if token != self._lib_album_token: return
         self._lib_clear_albums()
-        for al in albums:
-            alid, alname = al
-            iid = f"al{alid}"
-            self.tree_albums.insert("", "end", iid=iid, text=alname, image=self._make_icon("album"))
-            self._lib_albums[iid] = (str(alid), alname)
-            
-        self._lib_set_status(f"{artist_name} · {len(albums)} 张专辑 · 单击查看歌曲")
+
+        merged = {}
+        for al in albums or []:
+            try:
+                alid, alname = al
+            except Exception:
+                continue
+            k = str(alname or "").strip().lower()
+            if not k:
+                continue
+            merged.setdefault(k, {"name": alname, "alid": str(alid),
+                                  "local": False})
+        for name, cnt in (local_albums or []):
+            k = str(name or "").strip().lower()
+            if not k:
+                continue
+            if k in merged:
+                merged[k]["local"] = True
+            else:
+                merged[k] = {"name": name,
+                             "alid": "L|" + str(name), "local": True}
+
+        rows = sorted(merged.values(), key=lambda x: str(x["name"]).lower())
+        icon = self._make_icon("album")
+        for i, row in enumerate(rows):
+            iid = f"al{i}"
+            text = row["name"]          # ★ 专辑名后不加「· 本地」
+            kw = {"image": icon} if icon is not None else {}
+            self.tree_albums.insert("", "end", iid=iid, text=text, **kw)
+            self._lib_albums[iid] = (row["alid"], row["name"])
+        self._lib_set_status(f"{artist_name} · {len(rows)} 张专辑 · 单击查看歌曲")
 
         if getattr(self, "_kb_focus_albums", False):
             self._kb_focus_albums = False
-            if albums:
+            if rows:
                 self.tree_albums.selection_set(self.tree_albums.get_children()[0])
                 self.tree_albums.focus(self.tree_albums.get_children()[0])
                 self._kb_select_tracks = False
@@ -4392,12 +5786,25 @@ class ControlPanel:
         token = self._lib_track_token = self._lib_track_token + 1
 
         def work():
+            data = []
+            if album_id and not is_local_id(album_id):
+                try:
+                    data = self.lms.browse_tracks(album_id)
+                except Exception as e:
+                    print(f"[音乐库] {e}")
+                    data = []
+            # ★ 本地音乐：同一歌手/专辑下的曲目接在后面（本地曲目用 L| id）
+            local = []
             try:
-                data = self.lms.browse_tracks(album_id)
-            except Exception as e:
-                print(f"[音乐库] {e}")
-                data = []
-            self.panel.after(0, lambda: self._lib_fill_tracks(data, album_name, token))
+                artist_name = self._lib_current_artist
+                local = [
+                    (t["id"], t.get("track") or 0, t.get("title") or "")
+                    for t in self.local_lib.tracks_of(artist_name, album_name)
+                ]
+            except Exception:
+                local = []
+            self.panel.after(
+                0, lambda: self._lib_fill_tracks(data + local, album_name, token))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -4408,6 +5815,8 @@ class ControlPanel:
             tid, tno, tname = t
             iid = f"tr{tid}"
             label = f"{tno}. {tname}" if tno else tname
+            if is_local_id(tid):
+                label = f"{label}  ·  本地"
             self.tree_tracks.insert("", "end", iid=iid, text=label)
             self._lib_tracks[iid] = (str(tid), tname)
             
@@ -4631,7 +6040,7 @@ class ControlPanel:
         info = self._lib_artists.get(sel[0])
         if not info: return
         aid, aname = info
-        if not aid:
+        if not aid and not self.local_lib.has_artist(aname):
             self._lib_set_status(f"「{aname}」来自搜索结果，无独立 ID，无法浏览专辑")
             return
         self._lib_load_albums(aid, aname)
@@ -4642,7 +6051,9 @@ class ControlPanel:
         info = self._lib_albums.get(sel[0])
         if not info: return
         alid, alname = info
-        if not alid:
+        local_has = bool(self.local_lib.tracks_of(
+            getattr(self, "_lib_current_artist", ""), alname))
+        if not alid and not local_has:
             self._lib_set_status(f"「{alname}」缺少 ID，无法加载歌曲")
             return
         self._lib_load_tracks(alid, alname)
@@ -4653,6 +6064,23 @@ class ControlPanel:
         info = self._lib_tracks.get(sel[0])
         if not info: return
         tid, tname = info
+
+        # ★ 本地曲目：按当前扬声器决定在哪播
+        #   Windows 扬声器 → 本机引擎；达菲设备 → HTTP 推流给 LMS 拉流
+        if is_local_id(tid):
+            self._lib_last_synced_track = str(tid)
+            if self._win_mode:
+                self._play_local_track(tid, tname)
+            else:
+                self._play_local_on_daphile(tid, tname)
+            return
+
+        # ★ 当前是本机播放：这张专辑当作本地播放队列（曲目按需从达菲取回）
+        if self._win_mode:
+            self._lib_last_synced_track = str(tid)
+            self._win_queue_from_lib(tid)
+            return
+
         self._lib_last_synced_track = str(tid)
         self._play_mode = "smart"      # ★ 恢复智能切歌
         self.lms.play_track(tid)
@@ -4879,6 +6307,8 @@ class ControlPanel:
 
     def _migrate_legacy_fav_pl(self):
         """旧版 list 格式 → 按当前 MAC 分组的 dict。
+           另外把历史遗留的 "" 桶（播放页曾用 PLAYER_MAC 写入，通常为空串）
+           并入当前 HOST_MAC 桶，避免用户看到「收藏过却不见了」。
            若当前 MAC 尚未就绪则直接返回，后续会在 _ui_tick / reconnect 中再试。"""
         mac = self._get_current_host_mac()
         if not mac:
@@ -4893,6 +6323,8 @@ class ControlPanel:
             else:
                 self.cfg.FAVORITES = {}
             changed = True
+        elif isinstance(fav, dict):
+            changed |= self._merge_orphan_bucket("FAVORITES", mac)
 
         pl = getattr(self.cfg, "PLAYLISTS", None)
         if isinstance(pl, list):
@@ -4902,12 +6334,71 @@ class ControlPanel:
             else:
                 self.cfg.PLAYLISTS = {}
             changed = True
+        elif isinstance(pl, dict):
+            changed |= self._merge_orphan_bucket("PLAYLISTS", mac)
 
         if changed:
             try:
                 self.cfg.save()
             except Exception:
                 pass
+
+    def _merge_orphan_bucket(self, key, mac):
+        """把 cfg[key] 中 "" 桶的条目并入 mac 桶（收藏按 id 去重、歌单按名称合并）。"""
+        data = getattr(self.cfg, key, None)
+        if not isinstance(data, dict) or "" not in data:
+            return False
+
+        orphan = data.get("")
+        bucket = list(data.get(mac) or [])
+        moved = 0
+
+        if key == "FAVORITES":
+            ids = {str(b.get("id")) for b in bucket if isinstance(b, dict)}
+            for item in (orphan or []):
+                if not isinstance(item, dict):
+                    continue
+                tid = str(item.get("id"))
+                if tid and tid not in ids:
+                    bucket.append(item)
+                    ids.add(tid)
+                    moved += 1
+        else:
+            for item in (orphan or []):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "") or "").strip()
+                if not name:
+                    continue
+                target = None
+                for b in bucket:
+                    if (isinstance(b, dict)
+                            and str(b.get("name", "")).strip() == name):
+                        target = b
+                        break
+                if target is None:
+                    bucket.append(item)
+                else:
+                    tracks = list(target.get("tracks") or [])
+                    tids = {str(t.get("id")) for t in tracks
+                            if isinstance(t, dict)}
+                    for t in (item.get("tracks") or []):
+                        if not isinstance(t, dict):
+                            continue
+                        tid = str(t.get("id"))
+                        if tid not in tids:
+                            tracks.append(t)
+                            tids.add(tid)
+                    target["tracks"] = tracks
+                moved += 1
+
+        data[mac] = bucket
+        data.pop("", None)
+        setattr(self.cfg, key, data)
+        if moved:
+            label = "收藏" if key == "FAVORITES" else "歌单"
+            print(f"[{label}] 已把遗留空 MAC 桶的 {moved} 条数据并入 {mac}")
+        return True
 
     # ================= 收藏 / 歌单 =================
     def _is_favorite(self, track_id):
@@ -5167,6 +6658,25 @@ class ControlPanel:
                     d.arc((W * 0.48 - r, W * 0.5 - r,
                            W * 0.48 + r, W * 0.5 + r),
                           start=-60, end=60, fill=color, width=lw)
+
+            elif kind in ("repeat", "repeat_one"):
+                # 播放顺序图标：用字形渲染，并按墨迹包围盒居中（保证在圆心）
+                glyph = "⇉" if kind == "repeat" else "↻"
+                fnt = None
+                for fp in (r"C:\Windows\Fonts\seguisym.ttf",
+                           r"C:\Windows\Fonts\segoeui.ttf",
+                           r"C:\Windows\Fonts\arial.ttf"):
+                    try:
+                        fnt = ImageFont.truetype(fp, int(W * 0.82))
+                        break
+                    except Exception:
+                        fnt = None
+                if fnt is None:
+                    fnt = ImageFont.load_default()
+                bbox = d.textbbox((0, 0), glyph, font=fnt)
+                gw, gh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                d.text(((W - gw) / 2 - bbox[0], (W - gh) / 2 - bbox[1]),
+                       glyph, font=fnt, fill=color)
 
             elif kind == "check":
                 lw = max(3, int(W * 0.12))
@@ -5499,9 +7009,20 @@ class ControlPanel:
         }
 
     def _play_track_from_menu(self, tid):
-        """右键菜单「播放歌曲」：异步加载整张专辑并定位到指定曲目"""
+        """右键菜单「播放歌曲」：异步加载整张专辑并定位到指定曲目。
+           本地曲目走本地/推流两条路，不能交给 LMS。"""
         tid = str(tid or "")
         if not tid:
+            return
+
+        if is_local_id(tid):
+            t = self.local_lib.get(tid) or {}
+            name = t.get("title", "")
+            self._lib_last_synced_track = tid
+            if self._win_mode:
+                self._play_local_track(tid, name)
+            else:
+                self._play_local_on_daphile(tid, name)
             return
 
         def work():
@@ -5609,7 +7130,7 @@ class ControlPanel:
         except Exception:
             pass
         self._fav_tracks.clear()
-        favs = favs = self._get_favorites_for_current()
+        favs = self._get_favorites_for_current()
         for idx, f in enumerate(favs):
             if not isinstance(f, dict):
                 continue
@@ -6033,14 +7554,18 @@ class ControlPanel:
                                "artist": artist or "", "album": album or ""})
                 pl["tracks"] = tracks
                 self._set_playlists_for_current(playlists)
-                try:
-                    if self.nb.index(self.nb.select()) == 4:
-                        self._pl_refresh()
-                except Exception:
-                    pass
+                self._refresh_playlist_tab_if_visible()
                 return
         self._add_to_playlist_new(pl_name, tid, title, artist, album)
-        self._add_to_playlist_new(pl_name, tid, title, artist, album)
+        self._refresh_playlist_tab_if_visible()
+
+    def _refresh_playlist_tab_if_visible(self):
+        """歌单数据变化后刷新「歌单」页（仅在用户正看着它时才重绘）。"""
+        try:
+            if self.nb.index(self.nb.select()) == 4:
+                self._pl_refresh()
+        except Exception:
+            pass
 
     def _add_to_playlist_new(self, pl_name, track_id, title="", artist="", album=""):
         """「新建歌单」入口。防御：同名已存在时合并到已有歌单，绝不再追加新 dict。"""
@@ -6063,6 +7588,7 @@ class ControlPanel:
                                "artist": artist or "", "album": album or ""})
                 pl["tracks"] = tracks
                 self._set_playlists_for_current(playlists)
+                self._refresh_playlist_tab_if_visible()
                 return
 
         # 确实不存在才真正新建
@@ -6072,6 +7598,8 @@ class ControlPanel:
                         "artist": artist or "", "album": album or ""}],
         })
         self._set_playlists_for_current(playlists)
+        self._refresh_playlist_tab_if_visible()
+
     def _ask_yesno(self, title, message, danger=False):
         """自定义确认对话框，适配深浅主题 / Win11 磨砂 / 主面板居中。"""
         dlg = tk.Toplevel(self.panel)
@@ -6270,6 +7798,12 @@ class ControlPanel:
     
     # ================= 关机 =================
     def _shutdown_daphile(self):
+        # ★ 本地模式下没有达菲可关：这个按钮改为打开「连接 Daphile」窗口
+        if getattr(self.lms, "is_offline", False):
+            print("[关机] 本地模式：改为打开连接窗口")
+            self._after_shutdown()
+            return
+
         confirm = self._ask_yesno(
             "确认关机",
             "确定要关闭达菲设备吗？\n\n关机后需要手动开机或远程唤醒。",
@@ -6287,7 +7821,7 @@ class ControlPanel:
             if not ok:
                 def fail():
                     self._lib_set_status("关机指令发送失败，请检查网络")
-                    self.btn_shutdown.set_text("⏻")
+                    self.btn_shutdown.set_text("")
                     self.btn_shutdown.set_state(True)
                 self.panel.after(0, fail)
                 return
@@ -6306,7 +7840,7 @@ class ControlPanel:
                     self.panel.after(500, self._after_shutdown)
                 else:
                     self._lib_set_status("等待超时，设备可能仍在运行，请手动确认")
-                    self.btn_shutdown.set_text("⏻")
+                    self.btn_shutdown.set_text("")
                     self.btn_shutdown.set_state(True)
             self.panel.after(0, apply)
 
@@ -6333,6 +7867,10 @@ class ControlPanel:
         self._last_idx = -1
         self._lyrics_source = ""
         self.track_info = {}
+        self._ro_prev = None            # 重连后旧的轮询快照不再有效
+        self._ro_guard_until = 0.0
+        self._ro_hold_until = 0.0
+        self._ro_hold_tid = ""
 
         self._ns_loaded = False
         self._ns_current_album = None
@@ -6351,7 +7889,7 @@ class ControlPanel:
             pass
         
         try:
-            self.btn_shutdown.set_text("⏻")
+            self.btn_shutdown.set_text("")
             self.btn_shutdown.set_state(True)
         except Exception:
             pass
@@ -6375,6 +7913,11 @@ class ControlPanel:
             self._migrate_legacy_fav_pl()
         except Exception:
             traceback.print_exc()
+        # ★ 连接状态变化：按需显示/隐藏左上角三个按钮
+        try:
+            self._apply_header_visibility()
+        except Exception:
+            pass
             
     def _get_rounded_rect_photo(self, width, height, radius, fill):
         """PIL 超采样生成平滑圆角矩形，透明外框 + LANCZOS 缩小。
@@ -6780,6 +8323,70 @@ class ControlPanel:
         canvas.bind("<Enter>", on_enter)
         canvas.bind("<Leave>", on_leave)
         canvas.config(cursor="hand2")
+        redraw()
+        return canvas
+
+    def _make_icon_circle_btn(self, parent, icon_kind, cmd,
+                              diameter=38, icon_ratio=0.46):
+        """圆形图标按钮：与上一曲/下一曲同款外圆，图标严格画在圆心。
+
+           用 PIL 画的图标（而不是文字）保证视觉居中，hover 时圆底变高亮。"""
+        canvas = tk.Canvas(parent, width=diameter, height=diameter,
+                           bg=self.BG, highlightthickness=0, bd=0,
+                           cursor="hand2")
+        state = {"hover": False, "kind": icon_kind, "color": None}
+
+        def redraw():
+            try:
+                canvas.delete("all")
+            except tk.TclError:
+                return
+            d = diameter
+            c = d / 2.0
+            fill = self.SEL_BG if state["hover"] else self.CARD
+            photo = self._get_circle_photo(d, fill)
+            if photo is not None:
+                canvas.create_image(c, c, image=photo)
+                canvas._circle_photo = photo
+            else:
+                canvas.create_oval(1, 1, d - 1, d - 1, fill=fill, outline="")
+            if state["hover"]:
+                color = "#FFFFFF"
+            elif state["color"]:
+                color = state["color"]      # 例如收藏后的红心
+            else:
+                color = self.FG
+            icon = self._get_menu_icon_photo(
+                state["kind"], color, max(12, int(d * icon_ratio)))
+            if icon is not None:
+                canvas.create_image(c, c, image=icon)
+                canvas._icon_photo = icon
+            elif state["kind"] == "plus":
+                canvas.create_text(c, c, text="+", fill=color,
+                                   font=("Segoe UI Symbol", int(d * 0.42)))
+
+        def on_enter(_e):
+            state["hover"] = True
+            redraw()
+
+        def on_leave(_e):
+            state["hover"] = False
+            redraw()
+
+        def set_icon(kind, color=None):
+            if kind == state["kind"] and color == state["color"]:
+                return
+            state["kind"] = kind
+            state["color"] = color
+            redraw()
+
+        canvas.set_icon = set_icon
+        canvas.icon_kind = icon_kind
+        canvas._update_theme = lambda panel: (
+            canvas.configure(bg=panel.BG), redraw())
+        canvas.bind("<Button-1>", lambda _e: cmd())
+        canvas.bind("<Enter>", on_enter)
+        canvas.bind("<Leave>", on_leave)
         redraw()
         return canvas
 
@@ -8011,6 +9618,8 @@ class ControlPanel:
 
     def _player_tooltip_text(self):
         """播放器按钮 tooltip：动态反映当前连接状态与名称。"""
+        if self._win_mode:
+            return "播放器: Windows 扬声器（本机播放）"
         try:
             cur_mac = self.lms.player_mac() if self.lms else ""
         except Exception:

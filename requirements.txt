@@ -5,6 +5,14 @@
 #     若在 Linux 上运行，请先安装系统包：sudo apt install python3-tk
 #   · Pillow 用于显示专辑封面；未安装时程序仍可运行，只是封面区显示默认唱片图标。
 #   · requests 用于 LRCLIB 在线歌词源；未安装时自动跳过该源。
+#   · mutagen 用于读取本地音乐文件的标签（歌手 / 专辑 / 内嵌封面与歌词）。
+#   · miniaudio 不是通过 pip 安装的：它和依赖的 cffi / pycparser 已经内置在
+#     vendor/ 目录里（Windows 版，随程序一起分发），用于「Windows 扬声器」本机播放。
+#   · PyAV（内置 FFmpeg）同样内置在 vendor/av 里，负责解码 miniaudio 不支持的
+#     格式：APE / M4A(AAC/ALAC) / WMA / AIFF / DSF 等。
+#     缺少 vendor/ 时程序照常运行，只是「Windows 扬声器」不可用或只支持
+#     FLAC / MP3 / WAV / OGG。
 
 Pillow>=10.0.0
 requests>=2.31.0
+mutagen>=1.47.0
