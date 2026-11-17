@@ -43,6 +43,31 @@ def name_key(name):
     return str(name or "").strip().lower()
 
 
+def artist_key(name):
+    """歌手名归一化：去掉**所有空白**再小写。
+
+       用于把「G.E.M.邓紫棋」和「G.E.M. 邓紫棋」这类只差空格的写法
+       合并成同一个歌手（展示时优先不带空格的写法）。"""
+    return "".join(ch for ch in str(name or "") if not ch.isspace()).lower()
+
+
+def prefer_display_name(current, candidate):
+    """挑选更适合作显示的歌手名：优先「不含空白」的那个。"""
+    cur = str(current or "").strip()
+    cand = str(candidate or "").strip()
+    if not cand:
+        return cur
+    if not cur:
+        return cand
+    cur_ws = any(ch.isspace() for ch in cur)
+    cand_ws = any(ch.isspace() for ch in cand)
+    if cand_ws and not cur_ws:
+        return cur
+    if cur_ws and not cand_ws:
+        return cand
+    return cur
+
+
 def _txt(v):
     if v is None:
         return ""
@@ -164,6 +189,53 @@ class LocalLibrary:
         self.save()
         print(f"[本地音乐] 扫描完成: {len(found)} 首 / {total} 个文件")
         return len(found)
+
+    def refresh_incremental(self, progress=None):
+        """增量刷新（启动时用）：只读新增文件的标签、移除已删除的文件。
+
+           返回 (added, removed, total)。已有条目的标签不重读，
+           所以几千首的库也能很快完成。"""
+        if not self.folders:
+            return 0, 0, len(self.tracks)
+
+        disk = {}          # path -> 扫描根目录
+        for root_dir in self.folders:
+            if not os.path.isdir(root_dir):
+                continue
+            for root, dirs, files in os.walk(root_dir):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for fn in files:
+                    if os.path.splitext(fn)[1].lower() in AUDIO_EXTS:
+                        disk[os.path.join(root, fn)] = root_dir
+
+        with self._lock:
+            old = {t["path"]: t for t in self.tracks.values() if t.get("path")}
+        new_paths = [p for p in disk if p not in old]
+        removed = [p for p in old if p not in disk]
+        kept = [t for p, t in old.items() if p in disk]
+
+        total = len(new_paths)
+        added_tracks = []
+        for i, path in enumerate(new_paths):
+            if progress:
+                try:
+                    progress(i + 1, total, path)
+                except Exception:
+                    pass
+            info = self.read_tags(path, root=disk.get(path))
+            if info:
+                added_tracks.append(info)
+
+        # 仅当有变化时才重建索引并落盘
+        if added_tracks or removed:
+            with self._lock:
+                self._rebuild(kept + added_tracks)
+                import time
+                self.scanned_at = int(time.time())
+            self.save()
+        print(f"[本地音乐] 增量刷新: +{len(added_tracks)} / -{len(removed)}，"
+              f"共 {len(kept) + len(added_tracks)} 首")
+        return len(added_tracks), len(removed), len(kept) + len(added_tracks)
 
     def read_tags(self, path, root=None):
         """读一个文件的曲目信息；读不到标签时按目录/文件名兜底。
@@ -324,10 +396,12 @@ class LocalLibrary:
             if not tid:
                 continue
             self.tracks[tid] = t
-            akey = name_key(t.get("artist"))
+            # ★ 歌手键去掉所有空白：「G.E.M.邓紫棋」与「G.E.M. 邓紫棋」合并
+            akey = artist_key(t.get("artist"))
             alb_key = name_key(t.get("album"))
             node = self._artists.setdefault(
                 akey, {"name": t.get("artist") or "未知歌手", "albums": {}})
+            node["name"] = prefer_display_name(node["name"], t.get("artist"))
             alb = node["albums"].setdefault(
                 alb_key, {"name": t.get("album") or "未知专辑", "tracks": []})
             alb["tracks"].append(tid)
@@ -346,33 +420,50 @@ class LocalLibrary:
     def artists(self):
         """[(显示名, 曲目数)]，按名字排序。"""
         out = []
-        for node in self._artists.values():
-            n = sum(len(a["tracks"]) for a in node["albums"].values())
-            out.append((node["name"], n))
+        with self._lock:
+            for node in self._artists.values():
+                n = sum(len(a["tracks"]) for a in node["albums"].values())
+                out.append((node["name"], n))
         out.sort(key=lambda x: x[0].lower())
         return out
 
     def has_artist(self, name):
-        return name_key(name) in self._artists
+        with self._lock:
+            return artist_key(name) in self._artists
 
     def albums(self, artist_name):
         """[(专辑名, 曲目数)]"""
-        node = self._artists.get(name_key(artist_name))
-        if not node:
-            return []
-        out = [(a["name"], len(a["tracks"])) for a in node["albums"].values()]
+        with self._lock:
+            node = self._artists.get(artist_key(artist_name))
+            if not node:
+                return []
+            out = [(a["name"], len(a["tracks"]))
+                   for a in node["albums"].values()]
         out.sort(key=lambda x: x[0].lower())
         return out
 
     def tracks_of(self, artist_name, album_name):
         """该歌手该专辑下的曲目 dict 列表（按碟号/音轨号排序）。"""
-        node = self._artists.get(name_key(artist_name))
-        if not node:
-            return []
-        alb = node["albums"].get(name_key(album_name))
-        if not alb:
-            return []
-        return [self.tracks[t] for t in alb["tracks"] if t in self.tracks]
+        with self._lock:
+            node = self._artists.get(artist_key(artist_name))
+            if not node:
+                return []
+            alb = node["albums"].get(name_key(album_name))
+            if not alb:
+                return []
+            return [self.tracks[t] for t in alb["tracks"] if t in self.tracks]
+
+    def album_list(self):
+        """全部本地专辑：[(歌手, 专辑, 曲目数, 首曲 id)]，供「专辑」页合并展示。"""
+        out = []
+        with self._lock:
+            for node in self._artists.values():
+                for alb in node["albums"].values():
+                    tids = list(alb.get("tracks") or [])
+                    out.append((node["name"], alb.get("name") or "",
+                                len(tids), tids[0] if tids else ""))
+        out.sort(key=lambda x: (str(x[0]).lower(), str(x[1]).lower()))
+        return out
 
     def get(self, tid):
         return self.tracks.get(str(tid))
@@ -428,16 +519,51 @@ class LocalLibrary:
         # ② 内嵌歌词
         if not HAS_MUTAGEN:
             return ""
+        tags = None
         try:
             f = _MFile(t["path"])
             tags = getattr(f, "tags", None)
-            if tags is None:
+            if not tags:
                 return ""
+            # 已知的歌词键（ID3 / Vorbis / MP4 / APE），统一按大写比较
+            known = {"LYRICS", "UNSYNCEDLYRICS", "UNSYNCED LYRICS", "LYRIC",
+                     "LYRICS-XXX", "\xa9LYR", "©LYR", "SYNCEDLYRICS"}
             for key in list(tags.keys()):
-                k = str(key)
-                if k.startswith("USLT") or k in ("LYRICS", "UNSYNCEDLYRICS"):
-                    val = tags[key]
-                    return str(getattr(val, "text", val) or "")
+                ku = str(key).upper()
+                hit = (ku in known
+                       or ku.startswith("USLT") or ku.startswith("SYLT")
+                       or ku.startswith("LYRICS")
+                       or (ku.startswith("TXXX") and "LYRIC" in ku))
+                if not hit:
+                    continue
+                text = self._tag_lyrics_text(tags[key])
+                if text.strip():
+                    return text
+        except Exception as e:
+            print(f"[本地音乐] 读歌词失败 {t.get('path')}: "
+                  f"{type(e).__name__}: {e}")
+        # ③ 没找到：打印标签键，便于排查到底是哪种标签
+        try:
+            if tags is not None:
+                print(f"[本地音乐] 未找到内嵌歌词，标签键="
+                      f"{[str(k) for k in list(tags.keys())[:12]]}")
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def _tag_lyrics_text(val):
+        """把各种标签值统一成一段文本（ID3 帧 / Vorbis 列表 / 字符串）。"""
+        try:
+            if val is None:
+                return ""
+            if isinstance(val, (list, tuple)):
+                return "\n".join(str(x) for x in val)
+            text = getattr(val, "text", None)
+            if text is not None:
+                if isinstance(text, (list, tuple)):
+                    return "\n".join(str(x) for x in text)
+                return str(text)
+            return str(val)
+        except Exception:
+            return ""

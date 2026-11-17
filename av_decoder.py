@@ -10,9 +10,23 @@ miniaudio 只认 WAV/FLAC/MP3/OGG；APE、M4A/AAC/ALAC、WMA、AIFF、DSF 等
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_VENDOR = os.path.join(_HERE, "vendor")
-if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
+def _vendor_dir():
+    """内置依赖目录：开发时是源码目录下的 vendor/，
+       PyInstaller 打包后是解包目录 _MEIPASS/vendor（由 --add-data 提供）。"""
+    cands = []
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        cands.append(os.path.join(meipass, "vendor"))
+    cands.append(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "vendor"))
+    for c in cands:
+        if os.path.isdir(c):
+            return c
+    return ""
+
+
+_VENDOR = _vendor_dir()
+if _VENDOR and _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 
 try:

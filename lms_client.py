@@ -150,6 +150,8 @@ class LmsClient:
             "volume": vol,
             "queue": queue,
             "cur_index": cur_index,
+            "repeat": int(res.get("repeat", 0) or 0),
+            "shuffle": int(res.get("shuffle", 0) or 0),
         }
 
     # ---------- 播放控制 ----------
