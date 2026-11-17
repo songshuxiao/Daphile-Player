@@ -42,7 +42,7 @@ except ImportError:
     HAS_PIL = False
 
 
-APP_VERSION = "v11.0.0"
+APP_VERSION = "v11.5.0"
 APP_REPO = "songshuxiao/Daphile-Player"
 GITHUB_URL = f"https://github.com/{APP_REPO}"
 RELEASES_API = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
